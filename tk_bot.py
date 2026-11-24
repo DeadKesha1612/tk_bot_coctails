@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import telebot
 from telebot import types
 
-DEFAULT_BOT_TOKEN = "8797743243:AAHdcCLIwfSy-J-doYUFfLqozaxHQ9vaCSk"
+DEFAULT_BOT_TOKEN = "8797743243:AAHw8tDYRr-i9VPlXmjAThnVOmvcJUOx3vA"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
 PORT = int(os.environ.get("PORT", "10000"))
@@ -1561,9 +1561,9 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print(f"[NEW BUILD v9] Запуск бота (supabase: {sb_enabled()})...")
+    print(f"[NEW BUILD v9.1] Запуск бота (supabase: {sb_enabled()})...")
     try:
-        bot.delete_webhook(drop_pending_updates=False)
+        bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
     time.sleep(2)
