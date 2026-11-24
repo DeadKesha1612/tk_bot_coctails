@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import telebot
 from telebot import types
@@ -14,6 +15,7 @@ from telebot import types
 DEFAULT_BOT_TOKEN = "8797743243:AAH27Urfn7hbwHkpsZ_H0NLvhJ6yoGInZag"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
+PORT = int(os.environ.get("PORT", "10000"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
@@ -63,6 +65,33 @@ BTN_TO_SECTION = {
     BTN_USERS: "users",
     BTN_SUPPORT: "support",
 }
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server() -> None:
+    def _serve():
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", PORT), _HealthHandler)
+            print(f"[WEB] Listening on port {PORT}")
+            server.serve_forever()
+        except Exception as e:
+            print(f"[WARN] health server error: {e}")
+
+    threading.Thread(target=_serve, daemon=True).start()
 
 
 def now_str() -> str:
@@ -1345,9 +1374,10 @@ def handle_callbacks(call: types.CallbackQuery):
 
 
 def run_bot():
-    print("[NEW BUILD v2] Запуск бота...")
+    start_health_server()
+    print("[NEW BUILD v3] Запуск бота...")
     try:
-        bot.remove_webhook()
+        bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
     time.sleep(2)
