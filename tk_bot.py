@@ -13,7 +13,8 @@ from telebot import types
 # ==============================================================================
 # КОНФИГУРАЦИЯ
 # ==============================================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+DEFAULT_BOT_TOKEN = "8797743243:AAH27Urfn7hbwHkpsZ_H0NLvhJ6yoGInZag"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +22,7 @@ DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
 MEDIA_DIR = os.path.join(BASE_DIR, "user_media")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
+    raise RuntimeError("Не задан BOT_TOKEN")
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
@@ -554,7 +555,6 @@ def handle_wizard_input(message: types.Message):
     data = st.get("data", {})
     txt = (message.text or "").strip()
 
-    # 1. Добавление карточки рецепта / позиции в коктейльные вкладки
     if mode == "recipe_add":
         sec = data["section"]
         if step == "title":
@@ -623,7 +623,6 @@ def handle_wizard_input(message: types.Message):
             render_recipe_section(message.chat.id, uid, sec)
             return
 
-    # 2. Редактирование конкретного поля карточки
     if mode == "recipe_edit_field":
         sec = data["section"]
         item_id = data["item_id"]
@@ -681,7 +680,6 @@ def handle_wizard_input(message: types.Message):
             safe_send_recipe(message.chat.id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
         return
 
-    # 3. Добавление посуды
     if mode == "dishware_add":
         if step == "name":
             if not txt:
@@ -738,7 +736,6 @@ def handle_wizard_input(message: types.Message):
             render_dishware_section(message.chat.id, uid)
             return
 
-    # 4. Произвольное изменение остатка посуды (+N / -N / задать число)
     if mode == "dishware_adjust":
         try:
             num = int(txt)
@@ -761,7 +758,7 @@ def handle_wizard_input(message: types.Message):
             elif op == "sub":
                 delta = -abs(num)
                 new_qty = old_qty + delta
-            else:  # set
+            else:
                 new_qty = num
                 delta = new_qty - old_qty
 
@@ -785,7 +782,6 @@ def handle_wizard_input(message: types.Message):
         render_dishware_item(message.chat.id, uid, item_id)
         return
 
-    # 5. Редактирование текста раздела «Поддержать проект»
     if mode == "support_edit":
         if not txt:
             safe_send_text(message.chat.id, "Текст не может быть пустым. Введите текст:")
@@ -824,7 +820,6 @@ def handle_callbacks(call: types.CallbackQuery):
         open_section_by_key(chat_id, uid, sec, edit_msg_id=msg_id)
         return
 
-    # --- Карточки коктейлей / наливок ---
     if data.startswith("r_view:"):
         _, sec, item_id = data.split(":", 2)
         with DATA_LOCK:
@@ -980,7 +975,6 @@ def handle_callbacks(call: types.CallbackQuery):
         )
         return
 
-    # --- Посуда ---
     if data.startswith("d_view:"):
         item_id = data.split(":", 1)[1]
         with DATA_LOCK:
@@ -1109,7 +1103,6 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_edit_text(chat_id, msg_id, text, reply_markup=kb)
         return
 
-    # --- Пользователи и логи (только для админа) ---
     if data == "u_list":
         if not is_admin(uid):
             return
@@ -1179,7 +1172,6 @@ def handle_callbacks(call: types.CallbackQuery):
         safe_edit_text(chat_id, msg_id, text, reply_markup=kb)
         return
 
-    # --- Поддержать проект ---
     if data == "sup_edit":
         if not is_admin(uid):
             return
