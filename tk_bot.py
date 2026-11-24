@@ -2,6 +2,7 @@ import copy
 import html
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -29,9 +30,13 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 DATA_LOCK = threading.RLock()
 STATE_LOCK = threading.RLock()
+ALBUM_LOCK = threading.RLock()
 
 # Состояния пошагового ввода по user_id: {user_id: {"mode": ..., "step": ..., "data": ...}}
 USER_STATES = {}
+
+# Буфер медиагрупп (альбомов): {media_group_id: {"messages": [...], "timer": Timer}}
+ALBUM_BUFFER = {}
 
 RECIPE_SECTIONS = {
     "author": "Авторские",
@@ -76,6 +81,15 @@ def is_admin(user_id: int) -> bool:
 
 def esc(val) -> str:
     return html.escape("" if val is None else str(val))
+
+
+def clean_title_from_filename(filename: str | None, fallback: str) -> str:
+    if not filename:
+        return fallback
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = re.sub(r"[_\-]+", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return stem if stem else fallback
 
 
 def default_data() -> dict:
@@ -222,8 +236,8 @@ def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None) 
 
 def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
     title = esc(item.get("title", "Без названия"))
-    ingredients = esc(item.get("ingredients", "—"))
-    method = esc(item.get("method", "—"))
+    ingredients = esc(item.get("ingredients", ""))
+    method = esc(item.get("method", ""))
 
     parts = [f"<b>{title}</b>"]
     if item.get("ingredients"):
@@ -281,6 +295,12 @@ def skip_or_cancel_keyboard() -> types.ReplyKeyboardMarkup:
     return kb
 
 
+def bulk_done_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("✅ Готово"), types.KeyboardButton("❌ Отмена"))
+    return kb
+
+
 def recipe_section_inline(section: str, user_id: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     with DATA_LOCK:
@@ -297,6 +317,9 @@ def recipe_section_inline(section: str, user_id: int) -> types.InlineKeyboardMar
     if is_admin(user_id):
         kb.row(
             types.InlineKeyboardButton("➕ Добавить", callback_data=f"r_add:{section}"),
+            types.InlineKeyboardButton("📥 Массово", callback_data=f"r_bulk:{section}"),
+        )
+        kb.row(
             types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"r_edit_pick:{section}"),
             types.InlineKeyboardButton("🗑 Удалить", callback_data=f"r_del_pick:{section}"),
         )
@@ -500,6 +523,135 @@ def open_section_by_key(chat_id: int, user_id: int, section: str, edit_msg_id: i
 
 
 # ==============================================================================
+# МАССОВАЯ ЗАГРУЗКА ФАЙЛОВ И АЛЬБОМОВ
+# ==============================================================================
+def extract_media_payload(msg: types.Message) -> tuple[bytes | None, str | None, str | None]:
+    """Возвращает (bytes, ext, original_filename) если сообщение содержит фото или картинку-документ."""
+    if msg.content_type == "photo" and msg.photo:
+        file_info = bot.get_file(msg.photo[-1].file_id)
+        raw = bot.download_file(file_info.file_path)
+        return raw, ".jpg", None
+
+    if msg.content_type == "document" and msg.document:
+        doc = msg.document
+        mime = (doc.mime_type or "").lower()
+        orig_name = doc.file_name or ""
+        ext = os.path.splitext(orig_name)[1].lower()
+        if not ext and mime.startswith("image/"):
+            ext = "." + mime.split("/", 1)[1].replace("jpeg", "jpg")
+        if ext in (".png", ".jpg", ".jpeg", ".webp") or mime.startswith("image/"):
+            file_info = bot.get_file(doc.file_id)
+            raw = bot.download_file(file_info.file_path)
+            return raw, ext or ".png", orig_name
+
+    return None, None, None
+
+
+def commit_bulk_messages(uid: int, chat_id: int, sec: str, msgs: list[types.Message]) -> None:
+    st = get_state(uid)
+    if not st or st.get("mode") != "recipe_bulk":
+        return
+
+    added_titles = []
+    skipped_count = 0
+
+    with DATA_LOCK:
+        current_count = len(DB["recipes"].get(sec, []))
+        for idx, m in enumerate(msgs, start=1):
+            raw_bytes, ext, orig_name = extract_media_payload(m)
+            if not raw_bytes:
+                skipped_count += 1
+                continue
+
+            item_id = uuid.uuid4().hex[:8]
+            safe_ext = ext if ext in (".png", ".jpg", ".jpeg", ".webp") else ".jpg"
+            photo_path = os.path.join(MEDIA_DIR, f"{sec}_{item_id}{safe_ext}")
+            with open(photo_path, "wb") as f:
+                f.write(raw_bytes)
+
+            caption = (m.caption or "").strip()
+            fallback_title = f"Позиция {current_count + len(added_titles) + 1}"
+            if orig_name:
+                title = clean_title_from_filename(orig_name, fallback_title)
+            elif caption:
+                title = caption if len(msgs) == 1 else f"{caption} ({idx})"
+            else:
+                title = fallback_title
+
+            new_item = {
+                "id": item_id,
+                "title": title,
+                "ingredients": "",
+                "method": "",
+                "photo_path": photo_path,
+                "created_at": now_str(),
+            }
+            DB["recipes"].setdefault(sec, []).append(new_item)
+            added_titles.append(title)
+
+        if added_titles:
+            save_data_unlocked(DB)
+
+    if added_titles:
+        track_user_and_action(
+            msgs[0].from_user,
+            f"Массово загрузил ({len(added_titles)}) в «{RECIPE_SECTIONS[sec]}»: {', '.join(added_titles[:5])}",
+        )
+        preview = "\n".join(f"• <b>{esc(t)}</b>" for t in added_titles[:25])
+        extra = f"\n…и ещё {len(added_titles) - 25}" if len(added_titles) > 25 else ""
+        skip_note = f"\n<i>Пропущено неподходящих файлов: {skipped_count}</i>" if skipped_count else ""
+        safe_send_text(
+            chat_id,
+            f"✅ Добавлено позиций: <b>{len(added_titles)}</b>\n\n{preview}{extra}{skip_note}\n\n"
+            f"Можете отправлять ещё файлы или нажать <b>«✅ Готово»</b>.",
+            reply_markup=bulk_done_keyboard(),
+        )
+    elif skipped_count:
+        safe_send_text(
+            chat_id,
+            "⚠️ Не удалось распознать как картинку (поддерживаются PNG, JPG, WEBP и фото). Попробуйте ещё раз.",
+            reply_markup=bulk_done_keyboard(),
+        )
+
+
+def flush_album(media_group_id: str) -> None:
+    with ALBUM_LOCK:
+        entry = ALBUM_BUFFER.pop(media_group_id, None)
+    if not entry:
+        return
+    msgs = entry["messages"]
+    if not msgs:
+        return
+    first = msgs[0]
+    commit_bulk_messages(first.from_user.id, first.chat.id, entry["section"], msgs)
+
+
+def enqueue_bulk_message(message: types.Message, sec: str) -> None:
+    mgid = message.media_group_id
+    if not mgid:
+        commit_bulk_messages(message.from_user.id, message.chat.id, sec, [message])
+        return
+
+    with ALBUM_LOCK:
+        entry = ALBUM_BUFFER.get(mgid)
+        if entry is None:
+            timer = threading.Timer(0.7, flush_album, args=[mgid])
+            ALBUM_BUFFER[mgid] = {
+                "section": sec,
+                "messages": [message],
+                "timer": timer,
+            }
+            timer.start()
+        else:
+            entry["messages"].append(message)
+            if entry.get("timer"):
+                entry["timer"].cancel()
+            timer = threading.Timer(0.7, flush_album, args=[mgid])
+            entry["timer"] = timer
+            timer.start()
+
+
+# ==============================================================================
 # КОМАНДЫ И ГЛАВНОЕ МЕНЮ
 # ==============================================================================
 @bot.message_handler(commands=["start", "menu", "cancel"])
@@ -512,6 +664,17 @@ def cmd_start_or_cancel(message: types.Message):
         "<b>Главное меню</b>\nВыберите нужный раздел:",
         reply_markup=main_menu_keyboard(uid),
     )
+
+
+@bot.message_handler(func=lambda m: m.text == "✅ Готово")
+def btn_bulk_done(message: types.Message):
+    uid = message.from_user.id
+    st = get_state(uid)
+    set_state(uid, None)
+    track_user_and_action(message.from_user, "Завершил массовую загрузку")
+    safe_send_text(message.chat.id, "✅ Массовая загрузка завершена.", reply_markup=main_menu_keyboard(uid))
+    if st and st.get("return_section"):
+        open_section_by_key(message.chat.id, uid, st["return_section"])
 
 
 @bot.message_handler(func=lambda m: m.text == "❌ Отмена")
@@ -539,7 +702,7 @@ def handle_main_menu_buttons(message: types.Message):
 # ==============================================================================
 # ОБРАБОТЧИК ПОШАГОВОГО ВВОДА (ТОЛЬКО ДЛЯ АДМИНА)
 # ==============================================================================
-@bot.message_handler(content_types=["text", "photo"], func=lambda m: get_state(m.from_user.id) is not None)
+@bot.message_handler(content_types=["text", "photo", "document"], func=lambda m: get_state(m.from_user.id) is not None)
 def handle_wizard_input(message: types.Message):
     uid = message.from_user.id
     if not is_admin(uid):
@@ -554,6 +717,18 @@ def handle_wizard_input(message: types.Message):
     step = st.get("step")
     data = st.get("data", {})
     txt = (message.text or "").strip()
+
+    if mode == "recipe_bulk":
+        sec = data["section"]
+        if message.content_type in ("photo", "document"):
+            enqueue_bulk_message(message, sec)
+        else:
+            safe_send_text(
+                message.chat.id,
+                "Отправьте файлы/фото (можно сразу пачкой) или нажмите <b>«✅ Готово»</b>.",
+                reply_markup=bulk_done_keyboard(),
+            )
+        return
 
     if mode == "recipe_add":
         sec = data["section"]
@@ -585,10 +760,10 @@ def handle_wizard_input(message: types.Message):
         if step == "photo":
             photo_path = None
             item_id = uuid.uuid4().hex[:8]
-            if message.content_type == "photo" and message.photo:
-                file_info = bot.get_file(message.photo[-1].file_id)
-                raw_bytes = bot.download_file(file_info.file_path)
-                photo_path = os.path.join(MEDIA_DIR, f"{sec}_{item_id}.jpg")
+            raw_bytes, ext, _ = extract_media_payload(message)
+            if raw_bytes:
+                safe_ext = ext if ext in (".png", ".jpg", ".jpeg", ".webp") else ".jpg"
+                photo_path = os.path.join(MEDIA_DIR, f"{sec}_{item_id}{safe_ext}")
                 with open(photo_path, "wb") as f:
                     f.write(raw_bytes)
             elif txt == "⏭ Пропустить":
@@ -629,18 +804,18 @@ def handle_wizard_input(message: types.Message):
         field = data["field"]
 
         if field == "photo":
+            raw_bytes, ext, _ = extract_media_payload(message)
             if txt == "⏭ Пропустить":
                 new_photo = None
-            elif message.content_type == "photo" and message.photo:
-                file_info = bot.get_file(message.photo[-1].file_id)
-                raw_bytes = bot.download_file(file_info.file_path)
-                new_photo = os.path.join(MEDIA_DIR, f"{sec}_{item_id}_{uuid.uuid4().hex[:4]}.jpg")
+            elif raw_bytes:
+                safe_ext = ext if ext in (".png", ".jpg", ".jpeg", ".webp") else ".jpg"
+                new_photo = os.path.join(MEDIA_DIR, f"{sec}_{item_id}_{uuid.uuid4().hex[:4]}{safe_ext}")
                 with open(new_photo, "wb") as f:
                     f.write(raw_bytes)
             else:
                 safe_send_text(
                     message.chat.id,
-                    "Отправьте новое фото или нажмите <b>«⏭ Пропустить»</b> чтобы убрать картинку.",
+                    "Отправьте новое фото/файл или нажмите <b>«⏭ Пропустить»</b> чтобы убрать картинку.",
                     reply_markup=skip_or_cancel_keyboard(),
                 )
                 return
@@ -843,6 +1018,21 @@ def handle_callbacks(call: types.CallbackQuery):
         )
         return
 
+    if data.startswith("r_bulk:"):
+        if not is_admin(uid):
+            return
+        sec = data.split(":", 1)[1]
+        set_state(uid, {"mode": "recipe_bulk", "step": "files", "data": {"section": sec}, "return_section": sec})
+        safe_send_text(
+            chat_id,
+            f"<b>📥 Массовая загрузка в «{esc(RECIPE_SECTIONS[sec])}»</b>\n\n"
+            "Отправляйте сразу несколько файлов (PNG/JPG/WEBP как <b>файл</b> или <b>фото</b> / альбомом).\n"
+            "Название подхватится из имени файла (если файл) или из подписи.\n\n"
+            "Когда закончите — нажмите <b>«✅ Готово»</b>.",
+            reply_markup=bulk_done_keyboard(),
+        )
+        return
+
     if data.startswith("r_edit_pick:"):
         if not is_admin(uid):
             return
@@ -896,7 +1086,7 @@ def handle_callbacks(call: types.CallbackQuery):
         if field == "photo":
             safe_send_text(
                 chat_id,
-                "Отправьте новое фото/PNG или нажмите <b>«⏭ Пропустить»</b> чтобы удалить картинку:",
+                "Отправьте новое фото/файл или нажмите <b>«⏭ Пропустить»</b> чтобы удалить картинку:",
                 reply_markup=skip_or_cancel_keyboard(),
             )
         else:
