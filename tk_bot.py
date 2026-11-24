@@ -1403,23 +1403,27 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print("[NEW BUILD v4] Запуск бота...")
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    time.sleep(2)
+    print("[NEW BUILD v5] Запуск бота (safe polling)...")
+    offset = None
     while True:
         try:
-            bot.infinity_polling(
-                skip_pending=False,
-                timeout=25,
-                long_polling_timeout=25,
+            bot.delete_webhook(drop_pending_updates=False)
+            updates = bot.get_updates(
+                offset=offset,
+                timeout=15,
                 allowed_updates=["message", "callback_query"],
             )
+            if updates:
+                for upd in updates:
+                    offset = upd.update_id + 1
+                bot.process_new_updates(updates)
         except Exception as e:
-            print(f"[ERROR] polling crashed: {e}")
-            time.sleep(3)
+            err_text = str(e)
+            if "409" in err_text or "Conflict" in err_text:
+                time.sleep(3)
+            else:
+                print(f"[ERROR] polling: {e}")
+                time.sleep(2)
 
 
 if __name__ == "__main__":
