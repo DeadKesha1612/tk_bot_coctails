@@ -25,6 +25,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_DIR = os.path.join(BASE_DIR, "user_media")
+DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -35,6 +36,7 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 DATA_LOCK = threading.RLock()
 STATE_LOCK = threading.RLock()
 ALBUM_LOCK = threading.RLock()
+FILE_LOCK = threading.RLock()
 
 USER_STATES = {}
 ALBUM_BUFFER = {}
@@ -160,10 +162,10 @@ def sb_request(method: str, path: str, payload=None, prefer: str | None = None):
         return None
 
 
-def sb_select(table: str, query_params: str = "") -> list[dict]:
+def sb_select(table: str, query_params: str = "") -> list[dict] | None:
     q = f"?{query_params.lstrip('&')}" if query_params else ""
     res = sb_request("GET", f"{table}{q}")
-    return res if isinstance(res, list) else []
+    return res if isinstance(res, list) else None
 
 
 def sb_upsert(table: str, rows: list[dict] | dict, on_conflict: str | None = None) -> None:
@@ -204,59 +206,113 @@ def default_data() -> dict:
     }
 
 
+def save_local_snapshot(snapshot: dict) -> None:
+    with FILE_LOCK:
+        try:
+            tmp = f"{DATA_FILE}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, DATA_FILE)
+        except Exception as e:
+            print(f"[WARN] save_local_snapshot error: {e}")
+
+
+def sync_local_from_memory() -> None:
+    with DATA_LOCK:
+        snap = copy.deepcopy(DB)
+    save_local_snapshot(snap)
+
+
+def load_local_snapshot() -> dict:
+    data = default_data()
+    if not os.path.isfile(DATA_FILE):
+        return data
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return data
+        for sec in RECIPE_SECTIONS:
+            items = raw.get("recipes", {}).get(sec, [])
+            if isinstance(items, list):
+                data["recipes"][sec] = items
+        if isinstance(raw.get("dishware"), list):
+            data["dishware"] = raw["dishware"]
+        if isinstance(raw.get("dishware_logs"), list):
+            data["dishware_logs"] = raw["dishware_logs"]
+        if isinstance(raw.get("support"), dict) and isinstance(raw["support"].get("text"), str):
+            data["support"]["text"] = raw["support"]["text"]
+        if isinstance(raw.get("users"), dict):
+            data["users"] = raw["users"]
+        if isinstance(raw.get("activity_logs"), list):
+            data["activity_logs"] = raw["activity_logs"]
+    except Exception as e:
+        print(f"[WARN] load_local_snapshot error: {e}")
+    return data
+
+
 def load_data() -> dict:
     with DATA_LOCK:
-        data = default_data()
+        data = load_local_snapshot()
         if not sb_enabled():
-            print("[WARN] SUPABASE_URL или SUPABASE_KEY не заданы — данные в памяти до рестарта")
+            print("[INFO] Работаем в локальном режиме (bot_data.json)")
             return data
 
         recipe_rows = sb_select("tk_recipes", "order=created_at.asc")
-        for r in recipe_rows:
-            sec = r.get("section")
-            if sec in data["recipes"]:
-                data["recipes"][sec].append({
-                    "id": str(r.get("id")),
-                    "title": str(r.get("title") or "Без названия"),
-                    "ingredients": str(r.get("ingredients") or ""),
-                    "method": str(r.get("method") or ""),
-                    "photo_path": r.get("photo_path"),
-                    "photo_file_id": r.get("photo_file_id"),
-                    "created_at": str(r.get("created_at") or now_str()),
-                })
+        if recipe_rows is not None and len(recipe_rows) > 0:
+            data["recipes"] = {k: [] for k in RECIPE_SECTIONS}
+            for r in recipe_rows:
+                sec = r.get("section")
+                if sec in data["recipes"]:
+                    data["recipes"][sec].append({
+                        "id": str(r.get("id")),
+                        "title": str(r.get("title") or "Без названия"),
+                        "ingredients": str(r.get("ingredients") or ""),
+                        "method": str(r.get("method") or ""),
+                        "photo_path": r.get("photo_path"),
+                        "photo_file_id": r.get("photo_file_id"),
+                        "created_at": str(r.get("created_at") or now_str()),
+                    })
 
         dish_rows = sb_select("tk_dishware", "order=name.asc")
-        for d in dish_rows:
-            data["dishware"].append({
-                "id": str(d.get("id")),
-                "name": str(d.get("name") or "Посуда"),
-                "qty": int(d.get("qty") or 0),
-                "unit": str(d.get("unit") or "шт."),
-                "note": str(d.get("note") or ""),
-            })
+        if dish_rows is not None and len(dish_rows) > 0:
+            data["dishware"] = [
+                {
+                    "id": str(d.get("id")),
+                    "name": str(d.get("name") or "Посуда"),
+                    "qty": int(d.get("qty") or 0),
+                    "unit": str(d.get("unit") or "шт."),
+                    "note": str(d.get("note") or ""),
+                }
+                for d in dish_rows
+            ]
 
         dlog_rows = sb_select("tk_dishware_logs", "order=id.desc&limit=300")
-        data["dishware_logs"] = list(reversed(dlog_rows))
+        if dlog_rows is not None and len(dlog_rows) > 0:
+            data["dishware_logs"] = list(reversed(dlog_rows))
 
         sup_rows = sb_select("tk_support", "id=eq.main&limit=1")
         if sup_rows and isinstance(sup_rows[0].get("text"), str):
             data["support"]["text"] = sup_rows[0]["text"]
 
         user_rows = sb_select("tk_users", "order=last_seen.desc")
-        for u in user_rows:
-            uid_str = str(u.get("uid") or u.get("id"))
-            data["users"][uid_str] = {
-                "id": int(u.get("id") or 0),
-                "username": str(u.get("username") or "—"),
-                "name": str(u.get("name") or "Без имени"),
-                "first_seen": str(u.get("first_seen") or ""),
-                "last_seen": str(u.get("last_seen") or ""),
-                "actions_count": int(u.get("actions_count") or 0),
-            }
+        if user_rows is not None and len(user_rows) > 0:
+            for u in user_rows:
+                uid_str = str(u.get("uid") or u.get("id"))
+                data["users"][uid_str] = {
+                    "id": int(u.get("id") or 0),
+                    "username": str(u.get("username") or "—"),
+                    "name": str(u.get("name") or "Без имени"),
+                    "first_seen": str(u.get("first_seen") or ""),
+                    "last_seen": str(u.get("last_seen") or ""),
+                    "actions_count": int(u.get("actions_count") or 0),
+                }
 
         act_rows = sb_select("tk_activity_logs", "order=id.desc&limit=800")
-        data["activity_logs"] = list(reversed(act_rows))
+        if act_rows is not None and len(act_rows) > 0:
+            data["activity_logs"] = list(reversed(act_rows))
 
+        save_local_snapshot(data)
         return data
 
 
@@ -278,6 +334,7 @@ def get_state(user_id: int) -> dict | None:
 
 
 def persist_recipe(sec: str, item: dict) -> None:
+    sync_local_from_memory()
     row = {
         "id": str(item["id"]),
         "section": sec,
@@ -292,6 +349,7 @@ def persist_recipe(sec: str, item: dict) -> None:
 
 
 def delete_recipe_remote(item_id: str) -> None:
+    sync_local_from_memory()
     threading.Thread(
         target=sb_delete,
         args=("tk_recipes", f"id=eq.{urllib.parse.quote(str(item_id))}"),
@@ -300,6 +358,7 @@ def delete_recipe_remote(item_id: str) -> None:
 
 
 def persist_dishware(item: dict, log_entry: dict | None = None) -> None:
+    sync_local_from_memory()
     row = {
         "id": str(item["id"]),
         "name": str(item.get("name") or ""),
@@ -320,6 +379,7 @@ def persist_dishware(item: dict, log_entry: dict | None = None) -> None:
 
 
 def delete_dishware_remote(item_id: str) -> None:
+    sync_local_from_memory()
     threading.Thread(
         target=sb_delete,
         args=("tk_dishware", f"id=eq.{urllib.parse.quote(str(item_id))}"),
@@ -328,6 +388,7 @@ def delete_dishware_remote(item_id: str) -> None:
 
 
 def persist_support(text_val: str) -> None:
+    sync_local_from_memory()
     row = {"id": "main", "text": str(text_val)}
     threading.Thread(target=sb_upsert, args=("tk_support", row, "id"), daemon=True).start()
 
@@ -369,6 +430,8 @@ def track_user_and_action(user, action_text: str) -> None:
         DB["activity_logs"].append(ev)
         if len(DB["activity_logs"]) > 800:
             DB["activity_logs"] = DB["activity_logs"][-800:]
+
+    sync_local_from_memory()
 
     urow = {
         "uid": uid,
@@ -443,6 +506,7 @@ def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
                     safe_send_text(chat_id, caption, reply_markup=reply_markup)
             if sent and sent.photo:
                 item["photo_file_id"] = sent.photo[-1].file_id
+                sync_local_from_memory()
             return
         except Exception as e:
             print(f"[WARN] send_photo failed for {photo_path}: {e}")
@@ -1561,7 +1625,7 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print(f"[NEW BUILD v9.1] Запуск бота (supabase: {sb_enabled()})...")
+    print(f"[NEW BUILD v9.2] Запуск бота (supabase: {sb_enabled()})...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
