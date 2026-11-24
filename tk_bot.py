@@ -22,10 +22,69 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_DIR = os.path.join(BASE_DIR, "user_media")
 DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
+
+SCHEMA_SQL = """
+create table if not exists tk_recipes (
+  id text primary key,
+  section text not null,
+  title text not null,
+  ingredients text not null default '',
+  method text not null default '',
+  photo_path text,
+  photo_file_id text,
+  created_at text not null default ''
+);
+
+create table if not exists tk_dishware (
+  id text primary key,
+  name text not null,
+  qty integer not null default 0,
+  unit text not null default 'шт.',
+  note text not null default ''
+);
+
+create table if not exists tk_dishware_logs (
+  id bigserial primary key,
+  ts text not null,
+  name text not null,
+  delta integer not null default 0,
+  after integer not null default 0,
+  reason text not null default ''
+);
+
+create table if not exists tk_support (
+  id text primary key,
+  text text not null default ''
+);
+
+insert into tk_support (id, text)
+values ('main', 'Поддержать проект можно по реквизитам, которые администратор укажет в разделе редактирования.')
+on conflict (id) do nothing;
+
+create table if not exists tk_users (
+  uid text primary key,
+  id bigint not null,
+  username text not null default '—',
+  name text not null default 'Без имени',
+  first_seen text not null default '',
+  last_seen text not null default '',
+  actions_count integer not null default 0
+);
+
+create table if not exists tk_activity_logs (
+  id bigserial primary key,
+  ts text not null,
+  user_id bigint not null,
+  username text not null default '—',
+  name text not null default 'Без имени',
+  action text not null default ''
+);
+"""
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -99,6 +158,33 @@ def start_health_server() -> None:
             print(f"[WARN] health server error: {e}")
 
     threading.Thread(target=_serve, daemon=True).start()
+
+
+def ensure_tables_via_pg() -> None:
+    if not DATABASE_URL:
+        return
+    try:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            conn.execute(SCHEMA_SQL)
+        print("[DB] Таблицы tk_* проверены/созданы автоматически (psycopg)")
+        return
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[WARN] psycopg auto-create error: {e}")
+
+    try:
+        import psycopg2
+        with psycopg2.connect(DATABASE_URL) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA_SQL)
+        print("[DB] Таблицы tk_* проверены/созданы автоматически (psycopg2)")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[WARN] psycopg2 auto-create error: {e}")
 
 
 def now_str() -> str:
@@ -315,6 +401,7 @@ def load_data() -> dict:
         return data
 
 
+ensure_tables_via_pg()
 DB = load_data()
 
 
@@ -443,6 +530,95 @@ def track_user_and_action(user, action_text: str) -> None:
     }
     threading.Thread(target=sb_upsert, args=("tk_users", urow, "uid"), daemon=True).start()
     threading.Thread(target=sb_insert, args=("tk_activity_logs", ev), daemon=True).start()
+
+
+def normalize_search_query(raw_query: str) -> tuple[str, list[str]]:
+    cleaned = re.sub(r"\s+", " ", (raw_query or "").strip().lower())
+    # Убираем префикс типа "коктейль " только если после него есть ещё слова
+    without_prefix = re.sub(r"^(коктейль|коктейли|рецепт|наливка|наливки)\s+", "", cleaned).strip()
+    effective = without_prefix if without_prefix else cleaned
+    tokens = [t for t in re.split(r"[\s,.;:!?/\\()\"'«»]+", effective) if len(t) >= 2]
+    if not tokens and effective:
+        tokens = [effective]
+    return effective, tokens
+
+
+def search_entries(raw_query: str) -> list[dict]:
+    effective, tokens = normalize_search_query(raw_query)
+    if not tokens:
+        return []
+
+    results = []
+    with DATA_LOCK:
+        for sec, sec_title in RECIPE_SECTIONS.items():
+            for item in DB["recipes"].get(sec, []):
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "Без названия")
+                ingredients = str(item.get("ingredients") or "")
+                method = str(item.get("method") or "")
+                haystack = f"{title} {ingredients} {method}".lower()
+                title_l = title.lower()
+
+                score = 0
+                if effective and effective in title_l:
+                    score += 10
+                elif effective and effective in haystack:
+                    score += 5
+
+                matched_all = True
+                for tok in tokens:
+                    if tok in title_l:
+                        score += 3
+                    elif tok in haystack:
+                        score += 1
+                    else:
+                        matched_all = False
+
+                if score > 0 and (matched_all or effective in haystack):
+                    results.append({
+                        "kind": "recipe",
+                        "section": sec,
+                        "section_title": sec_title,
+                        "id": str(item.get("id")),
+                        "title": title,
+                        "score": score,
+                    })
+
+        for d in DB.get("dishware", []):
+            if not isinstance(d, dict):
+                continue
+            name = str(d.get("name") or "Посуда")
+            note = str(d.get("note") or "")
+            qty = int(d.get("qty") or 0)
+            unit = str(d.get("unit") or "шт.")
+            haystack = f"{name} {note}".lower()
+            name_l = name.lower()
+
+            score = 0
+            if effective and effective in name_l:
+                score += 8
+            elif effective and effective in haystack:
+                score += 4
+
+            for tok in tokens:
+                if tok in name_l:
+                    score += 2
+                elif tok in haystack:
+                    score += 1
+
+            if score > 0:
+                results.append({
+                    "kind": "dishware",
+                    "section": "dishware",
+                    "section_title": "Посуда",
+                    "id": str(d.get("id")),
+                    "title": f"{name} ({qty} {unit})",
+                    "score": score,
+                })
+
+    results.sort(key=lambda x: (-x["score"], x["title"].lower()))
+    return results[:15]
 
 
 def safe_send_text(chat_id: int, text: str, reply_markup=None) -> None:
@@ -923,7 +1099,7 @@ def cmd_start_or_cancel(message: types.Message):
     track_user_and_action(message.from_user, f"Команда {message.text or '/start'}")
     safe_send_text(
         message.chat.id,
-        "<b>Главное меню</b>\nВыберите нужный раздел:",
+        "<b>Главное меню</b>\nВыберите нужный раздел или просто напишите название коктейля / ингредиента для поиска:",
         reply_markup=main_menu_keyboard(uid),
     )
 
@@ -1236,6 +1412,40 @@ def handle_wizard_input(message: types.Message):
         safe_send_text(message.chat.id, "✅ Текст обновлён.", reply_markup=main_menu_keyboard(uid))
         render_support_section(message.chat.id, uid)
         return
+
+
+@bot.message_handler(content_types=["text"], func=lambda m: get_state(m.from_user.id) is None and not (m.text or "").startswith("/"))
+def handle_text_search(message: types.Message):
+    uid = message.from_user.id
+    query = (message.text or "").strip()
+    if not query:
+        return
+
+    track_user_and_action(message.from_user, f"Поиск: «{query[:60]}»")
+    matches = search_entries(query)
+
+    if not matches:
+        safe_send_text(
+            message.chat.id,
+            f"По запросу <b>«{esc(query)}»</b> ничего не нашёл.\n"
+            "Попробуйте другое слово или выберите раздел в меню.",
+            reply_markup=main_menu_keyboard(uid),
+        )
+        return
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    lines = [f"<b>🔎 Результаты по запросу «{esc(query)}»:</b>\n"]
+    for idx, m_item in enumerate(matches, start=1):
+        lines.append(f"{idx}. <b>{esc(m_item['title'])}</b> — <i>{esc(m_item['section_title'])}</i>")
+        if m_item["kind"] == "recipe":
+            cb = f"r_view:{m_item['section']}:{m_item['id']}"
+            btn_txt = f"📄 {m_item['title'][:45]} ({m_item['section_title'][:15]})"
+        else:
+            cb = f"d_view:{m_item['id']}"
+            btn_txt = f"🥂 {m_item['title'][:58]}"
+        kb.add(types.InlineKeyboardButton(text=btn_txt[:64], callback_data=cb))
+
+    safe_send_text(message.chat.id, "\n".join(lines), reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -1641,7 +1851,7 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print(f"[NEW BUILD v10.0] Запуск бота (supabase: {sb_enabled()})...")
+    print(f"[NEW BUILD v10.1] Запуск бота (supabase: {sb_enabled()}, pg_auto: {bool(DATABASE_URL)})...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
