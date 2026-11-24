@@ -1,651 +1,1214 @@
+import copy
+import html
+import json
 import os
-import glob
-import urllib.request
+import threading
+import time
+import uuid
+from datetime import datetime
+
 import telebot
 from telebot import types
-from PIL import Image, ImageDraw, ImageFont
 
-TOKEN = '8797743243:AAEasJGWiZpQuG4ztLJj8uCqdzkiXPP7tTs'
-bot = telebot.TeleBot(TOKEN)
+# ==============================================================================
+# КОНФИГУРАЦИЯ
+# ==============================================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
 
-CARDS_CACHE = {}
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
+MEDIA_DIR = os.path.join(BASE_DIR, "user_media")
 
-FONT_PATH = "DejaVuSans.ttf"
-if not os.path.exists(FONT_PATH):
-    try:
-        url = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
-        urllib.request.urlretrieve(url, FONT_PATH)
-    except Exception as e:
-        print(f"Не удалось скачать шрифт: {e}")
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
 
-def get_font(size):
-    try:
-        return ImageFont.truetype(FONT_PATH, size)
-    except:
-        return ImageFont.load_default()
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
-CLASSIC_NAMES = [
-    "дайкири", "маргарита", "секс на пляже", "манхэттен", 
-    "космополитен", "негрони", "черный русский", "сайдкар", "беллини"
-]
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+DATA_LOCK = threading.RLock()
+STATE_LOCK = threading.RLock()
 
-AUTHOR_NAMES = [
-    "жидкий опиум", "жаба", "алтайский хайбол", "сибирский экспресс", "клубничный взрыв",
-    "хиросима", "облака", "грейпфрутовый сауэр", "ягодный колинз", "зеленый мексиканец",
-    "унесенные ветром", "горящий ламборгини", "зеленая фурия", "старый кубинец", "синий кит", "краски"
-]
+# Состояния пошагового ввода по user_id: {user_id: {"mode": ..., "step": ..., "data": ...}}
+USER_STATES = {}
 
-CLASSIC_RECIPES = {
-    "Дайкири": {
-        "num": "201", "ml": "110 мл",
-        "ing": ["• Белый ром — 60 мл", "• Сок лайма — 30 мл", "• Сахарный сироп — 20 мл"],
-        "steps": ["1. Налить все ингредиенты в шейкер со льдом.", "2. Интенсивно взбить.", "3. Отцедить в охлажденный бокал купе."]
-    },
-    "Маргарита": {
-        "num": "202", "ml": "120 мл",
-        "ing": ["• Текила серебряная — 50 мл", "• Куантро (Трипл Сек) — 25 мл", "• Сок лайма — 25 мл"],
-        "steps": ["1. Сделать соляную кромку на бокале.", "2. Взбить ингредиенты со льдом в шейкере.", "3. Перелить в бокал маргарита."]
-    },
-    "Секс на пляже": {
-        "num": "203", "ml": "140 мл",
-        "ing": [
-            "• Водка — 40 мл", 
-            "• Персиковый ликер — 20 мл", 
-            "• Клюквенный морс — 40 мл", 
-            "• Апельсиновый сок — 40 мл"
-        ],
-        "steps": [
-            "1. Положить лёд в шейкер.", 
-            "2. Налить все компоненты (водку, персиковый ликер, клюквенный морс и апельсиновый сок).", 
-            "3. Интенсивно взбить и отцедить в бокал хайболл со льдом."
-        ]
-    },
-    "Манхэттен": {
-        "num": "204", "ml": "90 мл",
-        "ing": ["• Бурбон (или ржаной виски) — 50 мл", "• Красный вермут — 25 мл", "• Биттер Ангостура — 2 мл (2 дэш)"],
-        "steps": ["1. Смешать все ингредиенты в смесительном стакане со льдом.", "2. Процедить в охлажденный бокал мартини/купе.", "3. Украсить коктейльной вишней."]
-    },
-    "Космополитен": {
-        "num": "205", "ml": "120 мл",
-        "ing": ["• Цитрусовая водка — 40 мл", "• Куантро — 20 мл", "• Сок лайма — 15 мл", "• Клюквенный морс — 30 мл"],
-        "steps": ["1. Взбить все ингредиенты со льдом в шейкере.", "2. Отцедить в охлажденный бокал для мартини."]
-    },
-    "Негрони": {
-        "num": "206", "ml": "90 мл",
-        "ing": ["• Джин — 30 мл", "• Красный вермут — 30 мл", "• Кампари — 30 мл"],
-        "steps": ["1. Налить компоненты в рокс со льдом.", "2. Перемешать барной ложкой.", "3. Украсить цедрой апельсина."]
-    },
-    "Черный русский": {
-        "num": "207", "ml": "100 мл",
-        "ing": ["• Водка — 50 мл", "• Кофейный ликер (Калуа) — 25 мл"],
-        "steps": ["1. Наполнить стакан рокс кубиками льда.", "2. Налить водку и кофейный ликер.", "3. Перемешать."]
-    },
-    "Сайдкар": {
-        "num": "208", "ml": "100 мл",
-        "ing": ["• Коньяк — 50 мл", "• Куантро — 25 мл", "• Сок лимона — 25 мл"],
-        "steps": ["1. Сделать сахарную каемку на бокале.", "2. Взбить ингредиенты со льдом в шейкере.", "3. Отцедить в бокал."]
-    },
-    "Беллини": {
-        "num": "209", "ml": "150 мл",
-        "ing": ["• Персиковое пюре — 50 мл", "• Игристое вино (Просекко) — 100 мл"],
-        "steps": ["1. Положить персиковое пюре в охлажденный бокал флейт.", "2. Долить игристое вино.", "3. Аккуратно перемешать."]
-    }
+RECIPE_SECTIONS = {
+    "author": "Авторские",
+    "classic": "Классические",
+    "menu_cocktails": "Коктейли меню",
+    "tinctures": "Наливки",
 }
 
-AUTHOR_RECIPES = {
-    "Жидкий опиум": {
-        "num": "108", "ml": "225 мл",
-        "ing": [
-            "• Абсент — 25 г", 
-            "• Самбука — 25 г", 
-            "• Настойка Легенды Алтая — 25 г", 
-            "• Спрайт — 130 г", 
-            "• Сироп Гренадин — 20 г"
-        ],
-        "steps": [
-            "1. В Олд Фэшн налить сироп, настойку и спрайт.", 
-            "2. В снифтер налить самбуку и абсент, поджечь и прогреть.", 
-            "3. Накрыть хостером, дать подышать парами.", 
-            "4. Снова поджечь, перелить в Олд Фэшн, накрыв снифтером.", 
-            "5. Отставить снифтер на блюдце, Олд Фэшн накрыть салфеткой/хостером,", 
-            "ударьте о стойку (вспенить) и пить залпом, затем дать подышать парами."
-        ]
-    },
-    "Жаба": {
-        "num": "109", "ml": "225 мл",
-        "ing": [
-            "• Абсент — 25 г", 
-            "• Самбука — 25 г", 
-            "• Водка — 25 г", 
-            "• Игристое вино — 130 г", 
-            "• Сироп Мята — 20 г"
-        ],
-        "steps": [
-            "1. В Олд Фэшн налить сироп, водку и игристое вино.", 
-            "2. В снифтер налить самбуку и абсент, поджечь и прогреть.", 
-            "3. Накрыть хостером, дать подышать парами.", 
-            "4. Снова поджечь, перелить в Олд Фэшн, накрыв снифтером.", 
-            "5. Отставить снифтер на блюдце, Олд Фэшн накрыть салфеткой/хостером,", 
-            "ударьте о стойку (вспенить) и пить залпом, затем дать подышать парами."
-        ]
-    },
-    "Алтайский хайбол": {
-        "num": "110", "ml": "250 мл",
-        "ing": [
-            "• Алтайский бальзам — 40 мл",
-            "• Яблочный сок — 120 мл",
-            "• Имбирный эль — 80 мл",
-            "• Сок лайма — 10 мл"
-        ],
-        "steps": [
-            "1. Наполнить бокал хайболл кубиками льда.",
-            "2. Налить алкоголь и соки, долить имбирный эль.",
-            "3. Аккуратно перемешать барной ложкой и украсить."
-        ]
-    },
-    "Сибирский экспресс": {
-        "num": "111", "ml": "160 мл",
-        "ing": [
-            "• Клюквенный морс — 80 мл",
-            "• Водка — 40 мл",
-            "• Настойка Хаски клюква / Амг персик — 20 мл",
-            "• Сахарный сироп — 10 мл",
-            "• Сок лимона — 10 мл"
-        ],
-        "steps": [
-            "1. Налить все ингредиенты в шейкер со льдом.",
-            "2. Интенсивно взбить.",
-            "3. Отцедить в бокал со льдом."
-        ]
-    },
-    "Клубничный взрыв": {
-        "num": "112", "ml": "230 мл",
-        "ing": [
-            "• Джин — 40 мл",
-            "• Настойка АМГ Персик — 20 мл",
-            "• Сироп Клубника — 20 мл",
-            "• Сок лимона — 20 мл",
-            "• Тоник — 130 мл"
-        ],
-        "steps": [
-            "1. Наполнить бокал хайболл кубиками льда доверху.",
-            "2. Налить джин, настойку персика, клубничный сироп и сок лимона.",
-            "3. Долить тоник и аккуратно перемешать барной ложкой."
-        ]
-    },
-    "Хиросима": {
-        "num": "113", "ml": "50 мл",
-        "ing": [
-            "• Самбука — 15 мл",
-            "• Ликер Бейлис (Baileys) — 15 мл",
-            "• Абсент — 15 мл",
-            "• Гренадён (сироп) — 3-5 капель"
-        ],
-        "steps": [
-            "1. Налить самбуку в стопку.",
-            "2. Аккуратно по барной ложке слоями уложить Бейлис.",
-            "3. Сверху аккуратно влить абсент.",
-            "4. Капнуть гренадин в центр (он создаст эффект «гриба»).",
-            "5. Поджечь верхний слой по желанию и пить через трубочку."
-        ]
-    },
-    "Облака": {
-        "num": "114", "ml": "210 мл",
-        "ing": [
-            "• Самбука — 20 мл",
-            "• Текила серебряная — 20 мл",
-            "• Абсент — 15 мл",
-            "• Блю Кюрасао (ликер) — 10 мл",
-            "• Спрайт — 100 мл",
-            "• Ликер Бейлис — 15 мл"
-        ],
-        "steps": [
-            "1. В шейкере со льдом смешать крепкий алкоголь со спрайтом и ликерами.",
-            "2. Перецедить в хайболл со льдом.",
-            "3. Аккуратно влить сверху Бейлис, чтобы получился эффект облаков."
-        ]
-    },
-    "Грейпфрутовый сауэр": {
-        "num": "115", "ml": "160 мл",
-        "ing": [
-            "• Водка (или джин) — 50 мл",
-            "• Свежевыжатый грейпфрутовый сок — 60 мл",
-            "• Сахарный сироп — 20 мл",
-            "• Сок лимона — 15 мл"
-        ],
-        "steps": [
-            "1. Добавить все ингредиенты в шейкер со льдом.",
-            "2. Энергично взбить.",
-            "3. Отцедить в бокал рокс на свежий лед."
-        ]
-    },
-    "Ягодный Колинз": {
-        "num": "116", "ml": "240 мл",
-        "ing": [
-            "• Джин — 50 мл",
-            "• Ягодное пюре (смородина/малина) — 30 мл",
-            "• Сок лимона — 20 мл",
-            "• Сахарный сироп — 15 мл",
-            "• Содовая (или спрайт) — 100 мл"
-        ],
-        "steps": [
-            "1. Положить ягодное пюре, сок лимона и сироп в шейкер.",
-            "2. Добавить джин и лед, взбить.",
-            "3. Перелить в хайболл со льдом и долить содовой."
-        ]
-    },
-    "Зеленый мексиканц": {
-        "num": "117", "ml": "50 мл",
-        "ing": [
-            "• Ликер Пибанг (Банан) — 20 мл",
-            "• Ликер Бейлис — 15 мл",
-            "• Сок лайма — 15 мл"
-        ],
-        "steps": [
-            "1. Налить банановый ликер в стопку.",
-            "2. Аккуратно по ложке уложить Бейлис.",
-            "3. Сверху добавить сок лайма (кислота свернет сливки, создавая текстуру)."
-        ]
-    },
-    "Унесенные ветром": {
-        "num": "118", "ml": "120 мл",
-        "ing": [
-            "• Бурбон (или виски) — 40 мл",
-            "• Персиковый ликер — 20 мл",
-            "• Апельсиновый сок — 40 мл",
-            "• Гренадин — 10 мл"
-        ],
-        "steps": [
-            "1. Взбить все компоненты со льдом в шейкере.",
-            "2. Отцедить в охлажденный бокал коктейльную рюмку или купе."
-        ]
-    },
-    "Горящий Ламборгини": {
-        "num": "119", "ml": "150 мл",
-        "ing": [
-            "• Самбука — 25 мл",
-            "• Калуа (кофейный ликер) — 25 мл",
-            "• Бейлис — 25 мл",
-            "• Блю Кюрасао — 25 мл",
-            "• Абсент — 25 мл"
-        ],
-        "steps": [
-            "1. Налить Самбуку и Калуа в бокал для маргариты.",
-            "2. В два бокала шота налить Бейлис и Блю Кюрасао.",
-            "3. Поджечь основной бокал и залить сверху абсент.",
-            "4. Пить через трубочку из шотов, пока горит."
-        ]
-    },
-    "Зеленая фурия": {
-        "num": "120", "ml": "180 мл",
-        "ing": [
-            "• Джин — 40 мл",
-            "• Яблочный сок — 100 мл",
-            "• Яблочный сироп — 5 мл",
-            "• Сок лимона — 12 мл",
-            "• Киви — 1 кусочек"
-        ],
-        "steps": [
-            "1. Положить кусочек киви в шейкер и тщательно раздавить мадлером.",
-            "2. Добавить джин, яблочный сок, яблочный сироп и сок лимона.",
-            "3. Добавить лёд, энергично взбить в шейкере.",
-            "4. Перецедить в бокал аллегра или красный винник."
-        ]
-    },
-    "Старый кубинец": {
-        "num": "121", "ml": "200 мл",
-        "ing": [
-            "• Пряный ром — 50 мл",
-            "• Сахарный сироп — 15 мл",
-            "• Сок лимона — 15 мл",
-            "• Мята — 2 веточки",
-            "• Игристое вино (сухое/полусладкое) — до верха"
-        ],
-        "steps": [
-            "1. Положить мяту в шейкер, слегка примять.",
-            "2. Добавить прямой ром, сахарный сироп, сок лимона и лёд.",
-            "3. Интенсивно взбить в шейкере.",
-            "4. Перелить в бокал олд фэшн.",
-            "5. Долить до верха сухим или полусладким игристым вином."
-        ]
-    },
-    "Синий кит": {
-        "num": "122", "ml": "200 мл",
-        "ing": [
-            "• Водка — 50 мл",
-            "• Ликер Блю Кюрасао — 25 мл",
-            "• Самбука — 25 мл",
-            "• Трипл Сек — 25 мл",
-            "• Тоник — 100 мл"
-        ],
-        "steps": [
-            "1. В Олд Фэшн налить водку, ликер Блю Кюрасао, Трипл Сек и тоник.",
-            "2. В снифтер налить самбуку, поджечь и прогреть.",
-            "3. Накрыть хостером, дать подышать парами.",
-            "4. Снова поджечь, перелить в Олд Фэшн, накрыв снифтером.",
-            "5. Отставить снифтер на блюдце, Олд Фэшн накрыть салфеткой/хостером,",
-            "ударьте о стойку (вспенить) и пить залпом, затем дать подышать парами."
-        ]
-    },
-    "Краски (на 1 сет)": {
-        "num": "845", "ml": "180 мл",
-        "ing": [
-            "• Сок яблочный — 90 г",
-            "• Водка «Пять Озер» — 40 г",
-            "• Лимоны свежие — 33,3 г",
-            "• Сироп «Гренадин» — 5 г",
-            "• Сироп «Кюрасао Блю» — 5 г",
-            "• Сироп «Зеленое яблоко» — 5 г",
-            "• Сироп «Лимон» — 5 г",
-            "• Мармелад радуга — 20 г"
-        ],
-        "steps": [
-            "1. Лимоны перебирают, промывают проточной водой, обсушивают, нарезают дольками.",
-            "2. Из дольки лимона выжимают сок с помощью сквизера в шейкер, затем наливают водку и сок.",
-            "3. В 4 шота наливают сиропы (в каждый шот разный шот), затем аккуратно поверх сиропа наливают смесь из шейкера.",
-            "4. Каждый шот украшают мармеладом.",
-            "5. Коктейли готовят непосредственно перед подачей."
-        ]
-    },
-    "Краски (на большую бутылку)": {
-        "num": "124", "ml": "700 мл",
-        "ing": [
-            "• Водка — 200 мл",
-            "• Сок яблочный — 450 мл",
-            "• Сок лимона — 50 мл"
-        ],
-        "steps": [
-            "1. Тщательно смешать ингредиенты в большой емкости (бутылке).",
-            "2. Использовать для порционной выдачи."
-        ]
-    }
+ALL_SECTION_TITLES = {
+    **RECIPE_SECTIONS,
+    "dishware": "Посуда",
+    "users": "Пользователи",
+    "support": "Поддержать проект",
 }
 
-def create_single_card_image(name, data):
-    filename = f"{name}.png"
-    try:
-        img = Image.new('RGB', (900, 750), color=(255, 255, 255))
-        d = ImageDraw.Draw(img)
-        
-        font_title = get_font(18)
-        font_text = get_font(15)
-        
-        d.text((50, 20), "Предприятия: ООО «__________________»", fill=(0, 0, 0), font=font_text)
-        d.text((50, 50), "ШашлыкоFF (Коктейли)", fill=(0, 0, 0), font=font_text)
-        d.text((50, 80), f"ТЕХНОЛОГИЧЕСКАЯ КАРТА № {data['num']}", fill=(0, 0, 0), font=font_title)
-        d.text((50, 110), f"Наименование блюда: {name}", fill=(0, 0, 0), font=font_title)
-        d.text((550, 110), f"Выход: {data['ml']}", fill=(0, 0, 0), font=font_title)
-        
-        d.line([(50, 145), (850, 145)], fill=(0, 0, 0), width=2)
-        d.text((50, 155), "РЕЦЕПТУРА И ИНГРЕДИЕНТЫ:", fill=(0, 0, 0), font=font_title)
-        
-        y = 190
-        for ing in data['ing']:
-            d.text((70, y), ing, fill=(40, 40, 40), font=font_text)
-            y += 26
-            
-        d.line([(50, y + 5), (850, y + 5)], fill=(0, 0, 0), width=2)
-        
-        y += 20
-        d.text((50, y), "ТЕХНОЛОГИЯ ПРИГОТОВЛЕНИЯ:", fill=(0, 0, 0), font=font_title)
-        y += 30
-        for step in data['steps']:
-            d.text((70, y), step, fill=(40, 40, 40), font=font_text)
-            y += 26
-            
-        img.save(filename)
-    except Exception as e:
-        print(f"Ошибка генерации {name}: {e}")
+BTN_AUTHOR = "🍸 Авторские"
+BTN_CLASSIC = "🥃 Классические"
+BTN_MENU_COCKTAILS = "📋 Коктейли меню"
+BTN_TINCTURES = "🫙 Наливки"
+BTN_DISHWARE = "🥂 Посуда"
+BTN_USERS = "👥 Пользователи"
+BTN_SUPPORT = "💛 Поддержать проект"
 
-def generate_cards_images():
-    all_dict = {**CLASSIC_RECIPES, **AUTHOR_RECIPES}
-    for name, data in all_dict.items():
-        create_single_card_image(name, data)
+BTN_TO_SECTION = {
+    BTN_AUTHOR: "author",
+    BTN_CLASSIC: "classic",
+    BTN_MENU_COCKTAILS: "menu_cocktails",
+    BTN_TINCTURES: "tinctures",
+    BTN_DISHWARE: "dishware",
+    BTN_USERS: "users",
+    BTN_SUPPORT: "support",
+}
 
-def clean_name(raw_name):
-    words = raw_name.split()
-    filtered_words = [w for w in words if w.lower() not in ["page", "tk", "тк"]]
-    cleaned = " ".join(filtered_words).strip()
-    return cleaned if cleaned else raw_name
 
-def import_and_get_cards():
-    global CARDS_CACHE
-    CARDS_CACHE.clear()
-    generate_cards_images()
-    
-    cards = {}
-    files = glob.glob("*.png") + glob.glob("*.PNG")
-    idx = 0
-    for file_path in files:
-        base_name = os.path.basename(file_path)
-        if base_name.lower() == "ttk_temp.png":
-            continue
-        raw_name = os.path.splitext(base_name)[0].replace("_", " ").strip()
-        name = clean_name(raw_name)
-        lower_name = name.lower()
-        
-        if any(c in lower_name for c in CLASSIC_NAMES):
-            category = "classic"
-        elif any(a in lower_name for a in AUTHOR_NAMES):
-            category = "author"
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_admin(user_id: int) -> bool:
+    return int(user_id) == ADMIN_ID
+
+
+def esc(val) -> str:
+    return html.escape("" if val is None else str(val))
+
+
+def default_data() -> dict:
+    return {
+        "recipes": {
+            "author": [],
+            "classic": [],
+            "menu_cocktails": [],
+            "tinctures": [],
+        },
+        "dishware": [],
+        "dishware_logs": [],
+        "support": {
+            "text": "Поддержать проект можно по реквизитам, которые администратор укажет в разделе редактирования."
+        },
+        "users": {},
+        "activity_logs": [],
+    }
+
+
+def load_data() -> dict:
+    with DATA_LOCK:
+        if not os.path.exists(DATA_FILE):
+            data = default_data()
+            save_data_unlocked(data)
+            return data
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                return default_data()
+            base = default_data()
+            for sec in RECIPE_SECTIONS:
+                items = raw.get("recipes", {}).get(sec, [])
+                base["recipes"][sec] = items if isinstance(items, list) else []
+            if isinstance(raw.get("dishware"), list):
+                base["dishware"] = raw["dishware"]
+            if isinstance(raw.get("dishware_logs"), list):
+                base["dishware_logs"] = raw["dishware_logs"][-300:]
+            if isinstance(raw.get("support"), dict) and isinstance(raw["support"].get("text"), str):
+                base["support"]["text"] = raw["support"]["text"]
+            if isinstance(raw.get("users"), dict):
+                base["users"] = raw["users"]
+            if isinstance(raw.get("activity_logs"), list):
+                base["activity_logs"] = raw["activity_logs"][-800:]
+            return base
+        except Exception as e:
+            print(f"[ERROR] load_data: {e}")
+            return default_data()
+
+
+def save_data_unlocked(data: dict) -> None:
+    tmp_path = DATA_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, DATA_FILE)
+
+
+def save_data(data: dict) -> None:
+    with DATA_LOCK:
+        save_data_unlocked(data)
+
+
+DB = load_data()
+
+
+def set_state(user_id: int, state: dict | None) -> None:
+    with STATE_LOCK:
+        if state is None:
+            USER_STATES.pop(user_id, None)
         else:
-            category = "other"
-            
-        cards[lower_name] = (name, file_path, category)
-        CARDS_CACHE[str(idx)] = (name, file_path)
-        idx += 1
-        
-    return cards
+            USER_STATES[user_id] = state
 
-ITEMS_PER_PAGE = 6
 
-def get_main_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("🍸 Авторские", "🥃 Классические")
-    markup.add("📋 Список всех ТК")
-    return markup
+def get_state(user_id: int) -> dict | None:
+    with STATE_LOCK:
+        st = USER_STATES.get(user_id)
+        return copy.deepcopy(st) if st is not None else None
 
-def get_paged_keyboard(items_list, page=0, prefix="cat"):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    start_idx = page * ITEMS_PER_PAGE
-    end_idx = start_idx + ITEMS_PER_PAGE
-    current_page_items = items_list[start_idx:end_idx]
-    
-    for real_name, file_path, _ in current_page_items:
-        card_id = None
-        for cid, data in CARDS_CACHE.items():
-            if data[1] == file_path:
-                card_id = cid
-                break
-        if card_id is not None:
-            markup.add(types.InlineKeyboardButton(text=f"🍸 {real_name}", callback_data=f"id_{card_id}"))
-        
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{prefix}_page_{page - 1}"))
-    if end_idx < len(items_list):
-        nav_buttons.append(types.InlineKeyboardButton(text="Вперед ➡️", callback_data=f"{prefix}_page_{page + 1}"))
-    if nav_buttons:
-        markup.row(*nav_buttons)
-    return markup
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    cards = import_and_get_cards()
-    bot.send_message(
-        message.chat.id, 
-        f"Бот запущен на сервере! Загружено ТК: {len(cards)}.\nВыбери категорию в меню или напиши название коктейля текстом:", 
-        reply_markup=get_main_keyboard()
-    )
-
-@bot.message_handler(func=lambda message: message.text == "📋 Список всех ТК")
-def show_all_cards(message):
-    cards_dict = import_and_get_cards()
-    if not cards_dict:
-        bot.send_message(message.chat.id, "❌ Картинки не найдены.")
+def track_user_and_action(user, action_text: str) -> None:
+    if not user:
         return
-    items = list(cards_dict.values())
-    total_pages = int((len(items) - 1) // ITEMS_PER_PAGE + 1)
-    bot.send_message(message.chat.id, f"📋 **Все технологические карты** (Стр. 1 из {total_pages}):", reply_markup=get_paged_keyboard(items, 0, prefix="all"), parse_mode="Markdown")
+    uid = str(user.id)
+    username = f"@{user.username}" if getattr(user, "username", None) else "—"
+    first_name = (getattr(user, "first_name", "") or "").strip()
+    last_name = (getattr(user, "last_name", "") or "").strip()
+    full_name = f"{first_name} {last_name}".strip() or "Без имени"
+    ts = now_str()
 
-@bot.message_handler(func=lambda message: message.text == "🍸 Авторские")
-def show_author_cards(message):
-    cards_dict = import_and_get_cards()
-    items = [item for item in cards_dict.values() if item[2] == "author"]
-    if not items:
-        bot.send_message(message.chat.id, "❌ Пока нет авторских коктейлей.")
-        return
-        
-    total_pages = int((len(items) - 1) // ITEMS_PER_PAGE + 1)
-    bot.send_message(message.chat.id, f"🍸 **Авторские коктейли** (Стр. 1 из {total_pages}):", reply_markup=get_paged_keyboard(items, 0, prefix="cat_author"), parse_mode="Markdown")
+    with DATA_LOCK:
+        u = DB["users"].get(uid)
+        if not u:
+            u = {
+                "id": user.id,
+                "username": username,
+                "name": full_name,
+                "first_seen": ts,
+                "last_seen": ts,
+                "actions_count": 0,
+            }
+        u["username"] = username
+        u["name"] = full_name
+        u["last_seen"] = ts
+        u["actions_count"] = int(u.get("actions_count", 0)) + 1
+        DB["users"][uid] = u
 
-@bot.message_handler(func=lambda message: message.text == "🥃 Классические")
-def show_classic_cards(message):
-    cards_dict = import_and_get_cards()
-    items = [item for item in cards_dict.values() if item[2] == "classic"]
-    if not items:
-        bot.send_message(message.chat.id, "❌ Пока нет классических картинок.")
-        return
-        
-    total_pages = int((len(items) - 1) // ITEMS_PER_PAGE + 1)
-    bot.send_message(message.chat.id, f"🥃 **Классические коктейли** (Стр. 1 из {total_pages}):", reply_markup=get_paged_keyboard(items, 0, prefix="cat_classic"), parse_mode="Markdown")
+        DB["activity_logs"].append({
+            "ts": ts,
+            "user_id": user.id,
+            "username": username,
+            "name": full_name,
+            "action": action_text,
+        })
+        if len(DB["activity_logs"]) > 800:
+            DB["activity_logs"] = DB["activity_logs"][-800:]
 
-@bot.callback_query_handler(func=lambda call: 'page' in call.data)
-def handle_pagination(call):
-    bot.answer_callback_query(call.id)
-    parts = call.data.split('_')
-    page = int(parts[-1])
-    cards_dict = import_and_get_cards()
-    
-    if "all" in call.data:
-        prefix = "all"
-        cat_name = "Все технологические карты"
-        items = list(cards_dict.values())
-    elif "author" in call.data:
-        prefix = "cat_author"
-        cat_name = "Авторские коктейли"
-        items = [item for item in cards_dict.values() if item[2] == "author"]
-    else:
-        prefix = "cat_classic"
-        cat_name = "Классические коктейли"
-        items = [item for item in cards_dict.values() if item[2] == "classic"]
-        
-    total_pages = int((len(items) - 1) // ITEMS_PER_PAGE + 1)
-    
+        save_data_unlocked(DB)
+
+
+def safe_send_text(chat_id: int, text: str, reply_markup=None) -> None:
+    try:
+        bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+    except Exception:
+        plain = html.unescape(text)
+        try:
+            bot.send_message(chat_id, plain, reply_markup=reply_markup, parse_mode=None, disable_web_page_preview=True)
+        except Exception as e:
+            print(f"[ERROR] safe_send_text: {e}")
+
+
+def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None) -> None:
     try:
         bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=f"📂 **{cat_name}** (Стр. {page + 1} из {total_pages}):",
-            reply_markup=get_paged_keyboard(items, page, prefix=prefix),
-            parse_mode="Markdown"
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
         )
-    except Exception as e:
-        print(f"Ошибка пагинации: {e}")
+    except Exception:
+        safe_send_text(chat_id, text, reply_markup=reply_markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('id_'))
-def handle_card_selection(call):
-    card_id = call.data.replace('id_', '', 1)
-    if card_id in CARDS_CACHE:
-        real_name, file_path = CARDS_CACHE[card_id]
-        if not os.path.exists(file_path):
-            if real_name in AUTHOR_RECIPES:
-                create_single_card_image(real_name, AUTHOR_RECIPES[real_name])
-            elif real_name in CLASSIC_RECIPES:
-                create_single_card_image(real_name, CLASSIC_RECIPES[real_name])
-            
-        if os.path.exists(file_path):
-            bot.answer_callback_query(call.id, text=f"Отправка: {real_name}")
-            with open(file_path, 'rb') as photo:
-                bot.send_photo(call.message.chat.id, photo, caption=f"💥 Технологическая карта: **{real_name}**", parse_mode="Markdown")
-        else:
-            bot.answer_callback_query(call.id, text="Файл не найден на диске!", show_alert=True)
-    else:
-        bot.answer_callback_query(call.id, text="Устаревшая кнопка, вызовите список заново.", show_alert=True)
 
-@bot.message_handler(func=lambda message: message.text and message.text.strip().lower() == "краски")
-def send_paint_options(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("ТТК на 1 сет", callback_data="paint_set"),
-        types.InlineKeyboardButton("ТТК на большую бутылку", callback_data="paint_bottle")
+def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
+    title = esc(item.get("title", "Без названия"))
+    ingredients = esc(item.get("ingredients", "—"))
+    method = esc(item.get("method", "—"))
+
+    parts = [f"<b>{title}</b>"]
+    if item.get("ingredients"):
+        parts.append(f"\n<b>Состав:</b>\n{ingredients}")
+    if item.get("method"):
+        parts.append(f"\n<b>Приготовление:</b>\n{method}")
+    caption = "\n".join(parts)
+
+    photo_path = item.get("photo_path")
+    if photo_path and os.path.isfile(photo_path):
+        try:
+            with open(photo_path, "rb") as img:
+                if len(caption) <= 1024:
+                    bot.send_photo(chat_id, img, caption=caption, reply_markup=reply_markup)
+                else:
+                    bot.send_photo(chat_id, img)
+                    safe_send_text(chat_id, caption, reply_markup=reply_markup)
+            return
+        except Exception as e:
+            print(f"[WARN] send_photo failed for {photo_path}: {e}")
+
+    safe_send_text(chat_id, caption, reply_markup=reply_markup)
+
+
+def remove_file_if_exists(path: str | None) -> None:
+    if path and path.startswith(MEDIA_DIR) and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+# ==============================================================================
+# КЛАВИАТУРЫ
+# ==============================================================================
+def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_AUTHOR), types.KeyboardButton(BTN_CLASSIC))
+    kb.row(types.KeyboardButton(BTN_MENU_COCKTAILS), types.KeyboardButton(BTN_TINCTURES))
+    kb.row(types.KeyboardButton(BTN_DISHWARE), types.KeyboardButton(BTN_SUPPORT))
+    if is_admin(user_id):
+        kb.row(types.KeyboardButton(BTN_USERS))
+    return kb
+
+
+def cancel_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("❌ Отмена"))
+    return kb
+
+
+def skip_or_cancel_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("⏭ Пропустить"), types.KeyboardButton("❌ Отмена"))
+    return kb
+
+
+def recipe_section_inline(section: str, user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    with DATA_LOCK:
+        items = list(DB["recipes"].get(section, []))
+
+    for item in items:
+        kb.add(
+            types.InlineKeyboardButton(
+                text=f"📄 {item.get('title', 'Без названия')}",
+                callback_data=f"r_view:{section}:{item['id']}",
+            )
+        )
+
+    if is_admin(user_id):
+        kb.row(
+            types.InlineKeyboardButton("➕ Добавить", callback_data=f"r_add:{section}"),
+            types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"r_edit_pick:{section}"),
+            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"r_del_pick:{section}"),
+        )
+    return kb
+
+
+def recipe_item_inline(section: str, item_id: str, user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    if is_admin(user_id):
+        kb.add(
+            types.InlineKeyboardButton("✏️ Изменить", callback_data=f"r_edit_menu:{section}:{item_id}"),
+            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"r_del_ask:{section}:{item_id}"),
+        )
+    kb.add(types.InlineKeyboardButton("⬅️ Назад в раздел", callback_data=f"sec_open:{section}"))
+    return kb
+
+
+def recipe_edit_fields_inline(section: str, item_id: str) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("Название", callback_data=f"r_ef:{section}:{item_id}:title"),
+        types.InlineKeyboardButton("Состав", callback_data=f"r_ef:{section}:{item_id}:ingredients"),
+        types.InlineKeyboardButton("Приготовление", callback_data=f"r_ef:{section}:{item_id}:method"),
+        types.InlineKeyboardButton("Картинка", callback_data=f"r_ef:{section}:{item_id}:photo"),
     )
-    bot.send_message(message.chat.id, "🎨 Выберите вариант технологической карты для напитка «Краски»:", reply_markup=markup)
+    kb.add(types.InlineKeyboardButton("⬅️ К карточке", callback_data=f"r_view:{section}:{item_id}"))
+    return kb
 
-@bot.callback_query_handler(func=lambda call: call.data in ["paint_set", "paint_bottle"])
-def handle_paint_buttons(call):
-    bot.answer_callback_query(call.id)
-    if call.data == "paint_set":
-        target_name = "Краски (на 1 сет)"
-    else:
-        target_name = "Краски (на большую бутылку)"
-        
-    file_path = f"{target_name}.png"
-    
-    if not os.path.exists(file_path) and target_name in AUTHOR_RECIPES:
-        create_single_card_image(target_name, AUTHOR_RECIPES[target_name])
-        
-    if os.path.exists(file_path):
-        with open(file_path, 'rb') as photo:
-            bot.send_photo(call.message.chat.id, photo, caption=f"💥 Технологическая карта: **{target_name}**", parse_mode="Markdown")
-    else:
-        bot.send_message(call.message.chat.id, f"❌ Картинка для «{target_name}» не найдена.")
 
-@bot.message_handler(func=lambda message: True)
-def handle_text_search(message):
-    query_words = message.text.strip().lower().split()
-    cards_dict = import_and_get_cards()
-    if not cards_dict:
-        bot.send_message(message.chat.id, "❌ База картинок пуста.")
-        return
+def dishware_list_inline(user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    with DATA_LOCK:
+        items = list(DB["dishware"])
 
-    matched_cards = []
-    for key, (real_name, file_path, _) in cards_dict.items():
-        if all(word in key for word in query_words):
-            matched_cards.append((real_name, file_path))
-
-    if not matched_cards:
-        bot.send_message(message.chat.id, f"❌ По запросу «{message.text}» ничего не найдено.")
-        return
-
-    if len(matched_cards) > 1:
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        for real_name, file_path in matched_cards:
-            card_id = None
-            for cid, data in CARDS_CACHE.items():
-                if data[1] == file_path:
-                    card_id = cid
-                    break
-            
-            lower_name = real_name.lower()
-            if "без градуса" in lower_name or "безалкоголь" in lower_name:
-                btn_text = f"🟢 {real_name} (Без градуса)"
-            elif "дабл" in lower_name:
-                btn_text = f"🥛 {real_name} (Двойной / Дабл)"
-            else:
-                btn_text = f"🍸 {real_name}"
-            
-            if card_id is not None:
-                markup.add(types.InlineKeyboardButton(text=btn_text, callback_data=f"id_{card_id}"))
-        
-        bot.send_message(
-            message.chat.id, 
-            f"🔍 По запросу **«{message.text}»** найдено несколько вариантов. Выберите нужный:", 
-            reply_markup=markup, 
-            parse_mode="Markdown"
+    for d in items:
+        qty = int(d.get("qty", 0))
+        unit = d.get("unit") or "шт."
+        kb.add(
+            types.InlineKeyboardButton(
+                text=f"🥂 {d.get('name', 'Посуда')} — {qty} {unit}",
+                callback_data=f"d_view:{d['id']}",
+            )
         )
-    else:
-        real_name, file_path = matched_cards[0]
-        if not os.path.exists(file_path):
-            if real_name in AUTHOR_RECIPES:
-                create_single_card_image(real_name, AUTHOR_RECIPES[real_name])
-            elif real_name in CLASSIC_RECIPES:
-                create_single_card_image(real_name, CLASSIC_RECIPES[real_name])
-            
-        if os.path.exists(file_path):
-            with open(file_path, 'rb') as photo:
-                bot.send_photo(message.chat.id, photo, caption=f"💥 Технологическая карта: **{real_name}**", parse_mode="Markdown")
 
-if __name__ == '__main__':
-    print("Бот запущен на сервере...")
-    bot.infinity_polling()
+    if is_admin(user_id):
+        kb.row(
+            types.InlineKeyboardButton("➕ Добавить посуду", callback_data="d_add"),
+            types.InlineKeyboardButton("📜 История остатков", callback_data="d_logs"),
+        )
+    return kb
+
+
+def dishware_item_inline(item_id: str, user_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    if is_admin(user_id):
+        kb.row(
+            types.InlineKeyboardButton("➖ 1", callback_data=f"d_delta:{item_id}:-1"),
+            types.InlineKeyboardButton("➕ 1", callback_data=f"d_delta:{item_id}:1"),
+        )
+        kb.row(
+            types.InlineKeyboardButton("➖ N", callback_data=f"d_custom:{item_id}:sub"),
+            types.InlineKeyboardButton("➕ N", callback_data=f"d_custom:{item_id}:add"),
+        )
+        kb.row(
+            types.InlineKeyboardButton("✏️ Задать число", callback_data=f"d_set:{item_id}"),
+            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"d_del_ask:{item_id}"),
+        )
+    kb.add(types.InlineKeyboardButton("⬅️ К списку посуды", callback_data="sec_open:dishware"))
+    return kb
+
+
+def users_main_inline() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📋 Список пользователей", callback_data="u_list"),
+        types.InlineKeyboardButton("🕒 Лента последних действий", callback_data="u_logs"),
+    )
+    return kb
+
+
+def users_list_inline() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    with DATA_LOCK:
+        users = list(DB["users"].values())
+    users.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
+
+    for u in users[:30]:
+        label = f"{u.get('name', 'Без имени')} ({u.get('username', '—')}) • {u.get('actions_count', 0)}"
+        kb.add(types.InlineKeyboardButton(text=label[:64], callback_data=f"u_one:{u['id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="sec_open:users"))
+    return kb
+
+
+def support_inline(user_id: int) -> types.InlineKeyboardMarkup | None:
+    if not is_admin(user_id):
+        return None
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✏️ Редактировать текст", callback_data="sup_edit"))
+    return kb
+
+
+# ==============================================================================
+# ОТРИСОВКА РАЗДЕЛОВ
+# ==============================================================================
+def render_recipe_section(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
+    title = RECIPE_SECTIONS[section]
+    with DATA_LOCK:
+        count = len(DB["recipes"].get(section, []))
+    text = (
+        f"<b>{esc(title)}</b>\n"
+        f"Позиций в разделе: <b>{count}</b>\n"
+        + ("<i>Выберите карточку или воспользуйтесь кнопками управления ниже.</i>" if is_admin(user_id) else "<i>Выберите позицию для просмотра.</i>")
+    )
+    kb = recipe_section_inline(section, user_id)
+    if edit_msg_id:
+        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
+    else:
+        safe_send_text(chat_id, text, reply_markup=kb)
+
+
+def render_dishware_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
+    with DATA_LOCK:
+        items = list(DB["dishware"])
+    if not items:
+        text = "<b>🥂 Посуда</b>\n\nСписок посуды пока пуст."
+    else:
+        lines = ["<b>🥂 Посуда — текущие остатки:</b>\n"]
+        for d in items:
+            qty = int(d.get("qty", 0))
+            unit = esc(d.get("unit") or "шт.")
+            lines.append(f"• <b>{esc(d.get('name', 'Посуда'))}</b>: <b>{qty}</b> {unit}")
+        text = "\n".join(lines)
+
+    kb = dishware_list_inline(user_id)
+    if edit_msg_id:
+        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
+    else:
+        safe_send_text(chat_id, text, reply_markup=kb)
+
+
+def render_dishware_item(chat_id: int, user_id: int, item_id: str, edit_msg_id: int | None = None) -> None:
+    with DATA_LOCK:
+        item = next((x for x in DB["dishware"] if x["id"] == item_id), None)
+    if not item:
+        safe_send_text(chat_id, "Позиция посуды не найдена.", reply_markup=main_menu_keyboard(user_id))
+        return
+
+    qty = int(item.get("qty", 0))
+    unit = esc(item.get("unit") or "шт.")
+    note = esc(item.get("note") or "")
+    text = f"<b>🥂 {esc(item.get('name', 'Посуда'))}</b>\nОстаток: <b>{qty}</b> {unit}"
+    if note:
+        text += f"\nПримечание: {note}"
+
+    kb = dishware_item_inline(item_id, user_id)
+    if edit_msg_id:
+        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
+    else:
+        safe_send_text(chat_id, text, reply_markup=kb)
+
+
+def render_support_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
+    with DATA_LOCK:
+        raw_text = DB["support"].get("text", "")
+    text = f"<b>💛 Поддержать проект</b>\n\n{esc(raw_text)}"
+    kb = support_inline(user_id)
+    if edit_msg_id:
+        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
+    else:
+        safe_send_text(chat_id, text, reply_markup=kb)
+
+
+def render_users_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
+    if not is_admin(user_id):
+        return
+    with DATA_LOCK:
+        total_users = len(DB["users"])
+        total_logs = len(DB["activity_logs"])
+    text = (
+        "<b>👥 Пользователи и активность</b>\n\n"
+        f"Всего пользователей: <b>{total_users}</b>\n"
+        f"Записей в журнале действий: <b>{total_logs}</b>"
+    )
+    kb = users_main_inline()
+    if edit_msg_id:
+        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
+    else:
+        safe_send_text(chat_id, text, reply_markup=kb)
+
+
+def open_section_by_key(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
+    if section in RECIPE_SECTIONS:
+        render_recipe_section(chat_id, user_id, section, edit_msg_id=edit_msg_id)
+    elif section == "dishware":
+        render_dishware_section(chat_id, user_id, edit_msg_id=edit_msg_id)
+    elif section == "support":
+        render_support_section(chat_id, user_id, edit_msg_id=edit_msg_id)
+    elif section == "users":
+        if is_admin(user_id):
+            render_users_section(chat_id, user_id, edit_msg_id=edit_msg_id)
+
+
+# ==============================================================================
+# КОМАНДЫ И ГЛАВНОЕ МЕНЮ
+# ==============================================================================
+@bot.message_handler(commands=["start", "menu", "cancel"])
+def cmd_start_or_cancel(message: types.Message):
+    uid = message.from_user.id
+    set_state(uid, None)
+    track_user_and_action(message.from_user, f"Команда {message.text or '/start'}")
+    safe_send_text(
+        message.chat.id,
+        "<b>Главное меню</b>\nВыберите нужный раздел:",
+        reply_markup=main_menu_keyboard(uid),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "❌ Отмена")
+def btn_cancel(message: types.Message):
+    uid = message.from_user.id
+    st = get_state(uid)
+    set_state(uid, None)
+    track_user_and_action(message.from_user, "Отмена ввода")
+    safe_send_text(message.chat.id, "Действие отменено.", reply_markup=main_menu_keyboard(uid))
+    if st and st.get("return_section"):
+        open_section_by_key(message.chat.id, uid, st["return_section"])
+
+
+@bot.message_handler(func=lambda m: m.text in BTN_TO_SECTION)
+def handle_main_menu_buttons(message: types.Message):
+    uid = message.from_user.id
+    sec = BTN_TO_SECTION[message.text]
+    if sec == "users" and not is_admin(uid):
+        return
+    set_state(uid, None)
+    track_user_and_action(message.from_user, f"Открыл раздел «{ALL_SECTION_TITLES.get(sec, sec)}»")
+    open_section_by_key(message.chat.id, uid, sec)
+
+
+# ==============================================================================
+# ОБРАБОТЧИК ПОШАГОВОГО ВВОДА (ТОЛЬКО ДЛЯ АДМИНА)
+# ==============================================================================
+@bot.message_handler(content_types=["text", "photo"], func=lambda m: get_state(m.from_user.id) is not None)
+def handle_wizard_input(message: types.Message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        set_state(uid, None)
+        return
+
+    st = get_state(uid)
+    if not st:
+        return
+
+    mode = st.get("mode")
+    step = st.get("step")
+    data = st.get("data", {})
+    txt = (message.text or "").strip()
+
+    # 1. Добавление карточки рецепта / позиции в коктейльные вкладки
+    if mode == "recipe_add":
+        sec = data["section"]
+        if step == "title":
+            if not txt:
+                safe_send_text(message.chat.id, "Название не может быть пустым. Введите название текстом:")
+                return
+            data["title"] = txt
+            set_state(uid, {"mode": mode, "step": "ingredients", "data": data, "return_section": sec})
+            safe_send_text(message.chat.id, "Введите <b>состав и пропорции</b> (или отправьте <code>-</code>, если без состава):")
+            return
+
+        if step == "ingredients":
+            data["ingredients"] = "" if txt == "-" else txt
+            set_state(uid, {"mode": mode, "step": "method", "data": data, "return_section": sec})
+            safe_send_text(message.chat.id, "Введите <b>способ приготовления</b> (или отправьте <code>-</code>):")
+            return
+
+        if step == "method":
+            data["method"] = "" if txt == "-" else txt
+            set_state(uid, {"mode": mode, "step": "photo", "data": data, "return_section": sec})
+            safe_send_text(
+                message.chat.id,
+                "Отправьте <b>готовое фото / PNG</b> или нажмите <b>«⏭ Пропустить»</b>:",
+                reply_markup=skip_or_cancel_keyboard(),
+            )
+            return
+
+        if step == "photo":
+            photo_path = None
+            item_id = uuid.uuid4().hex[:8]
+            if message.content_type == "photo" and message.photo:
+                file_info = bot.get_file(message.photo[-1].file_id)
+                raw_bytes = bot.download_file(file_info.file_path)
+                photo_path = os.path.join(MEDIA_DIR, f"{sec}_{item_id}.jpg")
+                with open(photo_path, "wb") as f:
+                    f.write(raw_bytes)
+            elif txt == "⏭ Пропустить":
+                photo_path = None
+            else:
+                safe_send_text(
+                    message.chat.id,
+                    "Пришлите фото/картинку или нажмите <b>«⏭ Пропустить»</b>.",
+                    reply_markup=skip_or_cancel_keyboard(),
+                )
+                return
+
+            new_item = {
+                "id": item_id,
+                "title": data["title"],
+                "ingredients": data.get("ingredients", ""),
+                "method": data.get("method", ""),
+                "photo_path": photo_path,
+                "created_at": now_str(),
+            }
+            with DATA_LOCK:
+                DB["recipes"].setdefault(sec, []).append(new_item)
+                save_data_unlocked(DB)
+
+            set_state(uid, None)
+            track_user_and_action(message.from_user, f"Добавил в «{RECIPE_SECTIONS[sec]}»: {new_item['title']}")
+            safe_send_text(
+                message.chat.id,
+                f"✅ Позиция <b>{esc(new_item['title'])}</b> добавлена.",
+                reply_markup=main_menu_keyboard(uid),
+            )
+            render_recipe_section(message.chat.id, uid, sec)
+            return
+
+    # 2. Редактирование конкретного поля карточки
+    if mode == "recipe_edit_field":
+        sec = data["section"]
+        item_id = data["item_id"]
+        field = data["field"]
+
+        if field == "photo":
+            if txt == "⏭ Пропустить":
+                new_photo = None
+            elif message.content_type == "photo" and message.photo:
+                file_info = bot.get_file(message.photo[-1].file_id)
+                raw_bytes = bot.download_file(file_info.file_path)
+                new_photo = os.path.join(MEDIA_DIR, f"{sec}_{item_id}_{uuid.uuid4().hex[:4]}.jpg")
+                with open(new_photo, "wb") as f:
+                    f.write(raw_bytes)
+            else:
+                safe_send_text(
+                    message.chat.id,
+                    "Отправьте новое фото или нажмите <b>«⏭ Пропустить»</b> чтобы убрать картинку.",
+                    reply_markup=skip_or_cancel_keyboard(),
+                )
+                return
+
+            with DATA_LOCK:
+                item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
+                if item:
+                    remove_file_if_exists(item.get("photo_path"))
+                    item["photo_path"] = new_photo
+                    save_data_unlocked(DB)
+            set_state(uid, None)
+            track_user_and_action(message.from_user, f"Обновил картинку в «{RECIPE_SECTIONS[sec]}»")
+            safe_send_text(message.chat.id, "✅ Картинка обновлена.", reply_markup=main_menu_keyboard(uid))
+            if item:
+                safe_send_recipe(message.chat.id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
+            return
+
+        if not txt:
+            safe_send_text(message.chat.id, "Введите новое значение текстом:")
+            return
+
+        val = "" if txt == "-" else txt
+        if field == "title" and not val:
+            safe_send_text(message.chat.id, "Название не может быть пустым. Введите название:")
+            return
+
+        with DATA_LOCK:
+            item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
+            if item:
+                item[field] = val
+                save_data_unlocked(DB)
+
+        set_state(uid, None)
+        track_user_and_action(message.from_user, f"Отредактировал поле {field} в «{RECIPE_SECTIONS[sec]}»")
+        safe_send_text(message.chat.id, "✅ Изменения сохранены.", reply_markup=main_menu_keyboard(uid))
+        if item:
+            safe_send_recipe(message.chat.id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
+        return
+
+    # 3. Добавление посуды
+    if mode == "dishware_add":
+        if step == "name":
+            if not txt:
+                safe_send_text(message.chat.id, "Введите название посуды:")
+                return
+            data["name"] = txt
+            set_state(uid, {"mode": mode, "step": "qty", "data": data, "return_section": "dishware"})
+            safe_send_text(message.chat.id, "Введите начальный остаток (целое число, например <code>24</code>):")
+            return
+
+        if step == "qty":
+            try:
+                qty = int(txt)
+            except ValueError:
+                safe_send_text(message.chat.id, "Нужно ввести целое число, например <code>24</code> или <code>0</code>:")
+                return
+            data["qty"] = qty
+            set_state(uid, {"mode": mode, "step": "unit", "data": data, "return_section": "dishware"})
+            safe_send_text(
+                message.chat.id,
+                "Введите единицу измерения (например <code>шт.</code>) или нажмите <b>«⏭ Пропустить»</b>:",
+                reply_markup=skip_or_cancel_keyboard(),
+            )
+            return
+
+        if step == "unit":
+            unit = "шт." if txt in ("", "⏭ Пропустить", "-") else txt
+            item_id = uuid.uuid4().hex[:8]
+            new_d = {
+                "id": item_id,
+                "name": data["name"],
+                "qty": int(data["qty"]),
+                "unit": unit,
+                "note": "",
+            }
+            with DATA_LOCK:
+                DB["dishware"].append(new_d)
+                DB["dishware_logs"].append({
+                    "ts": now_str(),
+                    "name": new_d["name"],
+                    "delta": new_d["qty"],
+                    "after": new_d["qty"],
+                    "reason": "создание позиции",
+                })
+                save_data_unlocked(DB)
+
+            set_state(uid, None)
+            track_user_and_action(message.from_user, f"Добавил посуду: {new_d['name']} ({new_d['qty']} {unit})")
+            safe_send_text(
+                message.chat.id,
+                f"✅ Позиция <b>{esc(new_d['name'])}</b> ({new_d['qty']} {esc(unit)}) добавлена.",
+                reply_markup=main_menu_keyboard(uid),
+            )
+            render_dishware_section(message.chat.id, uid)
+            return
+
+    # 4. Произвольное изменение остатка посуды (+N / -N / задать число)
+    if mode == "dishware_adjust":
+        try:
+            num = int(txt)
+        except ValueError:
+            safe_send_text(message.chat.id, "Введите целое число:")
+            return
+
+        op = data["op"]
+        item_id = data["item_id"]
+        with DATA_LOCK:
+            d = next((x for x in DB["dishware"] if x["id"] == item_id), None)
+            if not d:
+                set_state(uid, None)
+                safe_send_text(message.chat.id, "Позиция не найдена.", reply_markup=main_menu_keyboard(uid))
+                return
+            old_qty = int(d.get("qty", 0))
+            if op == "add":
+                delta = abs(num)
+                new_qty = old_qty + delta
+            elif op == "sub":
+                delta = -abs(num)
+                new_qty = old_qty + delta
+            else:  # set
+                new_qty = num
+                delta = new_qty - old_qty
+
+            d["qty"] = new_qty
+            DB["dishware_logs"].append({
+                "ts": now_str(),
+                "name": d["name"],
+                "delta": delta,
+                "after": new_qty,
+                "reason": f"было {old_qty} → стало {new_qty}",
+            })
+            save_data_unlocked(DB)
+
+        set_state(uid, None)
+        track_user_and_action(message.from_user, f"Изменил остаток «{d['name']}»: {old_qty} → {new_qty}")
+        safe_send_text(
+            message.chat.id,
+            f"✅ Остаток <b>{esc(d['name'])}</b>: <b>{old_qty}</b> → <b>{new_qty}</b>",
+            reply_markup=main_menu_keyboard(uid),
+        )
+        render_dishware_item(message.chat.id, uid, item_id)
+        return
+
+    # 5. Редактирование текста раздела «Поддержать проект»
+    if mode == "support_edit":
+        if not txt:
+            safe_send_text(message.chat.id, "Текст не может быть пустым. Введите текст:")
+            return
+        with DATA_LOCK:
+            DB["support"]["text"] = txt
+            save_data_unlocked(DB)
+        set_state(uid, None)
+        track_user_and_action(message.from_user, "Обновил текст раздела «Поддержать проект»")
+        safe_send_text(message.chat.id, "✅ Текст обновлён.", reply_markup=main_menu_keyboard(uid))
+        render_support_section(message.chat.id, uid)
+        return
+
+
+# ==============================================================================
+# INLINE CALLBACKS
+# ==============================================================================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call: types.CallbackQuery):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    data = call.data or ""
+
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    if data.startswith("sec_open:"):
+        sec = data.split(":", 1)[1]
+        if sec == "users" and not is_admin(uid):
+            return
+        set_state(uid, None)
+        track_user_and_action(call.from_user, f"Открыл раздел «{ALL_SECTION_TITLES.get(sec, sec)}»")
+        open_section_by_key(chat_id, uid, sec, edit_msg_id=msg_id)
+        return
+
+    # --- Карточки коктейлей / наливок ---
+    if data.startswith("r_view:"):
+        _, sec, item_id = data.split(":", 2)
+        with DATA_LOCK:
+            item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
+        if not item:
+            safe_send_text(chat_id, "Карточка не найдена.")
+            return
+        track_user_and_action(call.from_user, f"Открыл «{item.get('title')}» в «{RECIPE_SECTIONS.get(sec, sec)}»")
+        safe_send_recipe(chat_id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
+        return
+
+    if data.startswith("r_add:"):
+        if not is_admin(uid):
+            return
+        sec = data.split(":", 1)[1]
+        set_state(uid, {"mode": "recipe_add", "step": "title", "data": {"section": sec}, "return_section": sec})
+        safe_send_text(
+            chat_id,
+            f"<b>Добавление в «{esc(RECIPE_SECTIONS[sec])}»</b>\n\nВведите <b>название</b>:",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    if data.startswith("r_edit_pick:"):
+        if not is_admin(uid):
+            return
+        sec = data.split(":", 1)[1]
+        with DATA_LOCK:
+            items = list(DB["recipes"].get(sec, []))
+        if not items:
+            safe_send_text(chat_id, "В этом разделе пока нет карточек для редактирования.")
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for it in items:
+            kb.add(
+                types.InlineKeyboardButton(
+                    f"✏️ {it.get('title', 'Без названия')}",
+                    callback_data=f"r_edit_menu:{sec}:{it['id']}",
+                )
+            )
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"sec_open:{sec}"))
+        safe_edit_text(chat_id, msg_id, "Выберите карточку для редактирования:", reply_markup=kb)
+        return
+
+    if data.startswith("r_edit_menu:"):
+        if not is_admin(uid):
+            return
+        _, sec, item_id = data.split(":", 2)
+        with DATA_LOCK:
+            item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
+        if not item:
+            safe_send_text(chat_id, "Карточка не найдена.")
+            return
+        safe_send_text(
+            chat_id,
+            f"Что редактируем в <b>{esc(item.get('title'))}</b>?",
+            reply_markup=recipe_edit_fields_inline(sec, item_id),
+        )
+        return
+
+    if data.startswith("r_ef:"):
+        if not is_admin(uid):
+            return
+        _, sec, item_id, field = data.split(":", 3)
+        set_state(
+            uid,
+            {
+                "mode": "recipe_edit_field",
+                "step": "value",
+                "data": {"section": sec, "item_id": item_id, "field": field},
+                "return_section": sec,
+            },
+        )
+        if field == "photo":
+            safe_send_text(
+                chat_id,
+                "Отправьте новое фото/PNG или нажмите <b>«⏭ Пропустить»</b> чтобы удалить картинку:",
+                reply_markup=skip_or_cancel_keyboard(),
+            )
+        else:
+            prompts = {
+                "title": "Введите новое <b>название</b>:",
+                "ingredients": "Введите новый <b>состав</b> (или <code>-</code> для очистки):",
+                "method": "Введите новый <b>способ приготовления</b> (или <code>-</code> для очистки):",
+            }
+            safe_send_text(chat_id, prompts.get(field, "Введите новое значение:"), reply_markup=cancel_keyboard())
+        return
+
+    if data.startswith("r_del_pick:"):
+        if not is_admin(uid):
+            return
+        sec = data.split(":", 1)[1]
+        with DATA_LOCK:
+            items = list(DB["recipes"].get(sec, []))
+        if not items:
+            safe_send_text(chat_id, "В этом разделе пока нет карточек для удаления.")
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for it in items:
+            kb.add(
+                types.InlineKeyboardButton(
+                    f"🗑 {it.get('title', 'Без названия')}",
+                    callback_data=f"r_del_ask:{sec}:{it['id']}",
+                )
+            )
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"sec_open:{sec}"))
+        safe_edit_text(chat_id, msg_id, "Выберите карточку для удаления:", reply_markup=kb)
+        return
+
+    if data.startswith("r_del_ask:"):
+        if not is_admin(uid):
+            return
+        _, sec, item_id = data.split(":", 2)
+        with DATA_LOCK:
+            item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
+        if not item:
+            safe_send_text(chat_id, "Карточка уже удалена.")
+            return
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"r_del_yes:{sec}:{item_id}"),
+            types.InlineKeyboardButton("❌ Отмена", callback_data=f"sec_open:{sec}"),
+        )
+        safe_send_text(
+            chat_id,
+            f"Удалить карточку <b>{esc(item.get('title'))}</b>?",
+            reply_markup=kb,
+        )
+        return
+
+    if data.startswith("r_del_yes:"):
+        if not is_admin(uid):
+            return
+        _, sec, item_id = data.split(":", 2)
+        deleted_title = ""
+        with DATA_LOCK:
+            arr = DB["recipes"].get(sec, [])
+            kept = []
+            for it in arr:
+                if it["id"] == item_id:
+                    deleted_title = it.get("title", "")
+                    remove_file_if_exists(it.get("photo_path"))
+                else:
+                    kept.append(it)
+            DB["recipes"][sec] = kept
+            save_data_unlocked(DB)
+        track_user_and_action(call.from_user, f"Удалил из «{RECIPE_SECTIONS.get(sec, sec)}»: {deleted_title}")
+        safe_edit_text(
+            chat_id,
+            msg_id,
+            f"🗑 Удалено: <b>{esc(deleted_title or item_id)}</b>",
+            reply_markup=recipe_section_inline(sec, uid),
+        )
+        return
+
+    # --- Посуда ---
+    if data.startswith("d_view:"):
+        item_id = data.split(":", 1)[1]
+        with DATA_LOCK:
+            d = next((x for x in DB["dishware"] if x["id"] == item_id), None)
+        if d:
+            track_user_and_action(call.from_user, f"Открыл посуду «{d.get('name')}»")
+        render_dishware_item(chat_id, uid, item_id, edit_msg_id=msg_id)
+        return
+
+    if data == "d_add":
+        if not is_admin(uid):
+            return
+        set_state(uid, {"mode": "dishware_add", "step": "name", "data": {}, "return_section": "dishware"})
+        safe_send_text(chat_id, "<b>Новая позиция посуды</b>\n\nВведите название:", reply_markup=cancel_keyboard())
+        return
+
+    if data.startswith("d_delta:"):
+        if not is_admin(uid):
+            return
+        _, item_id, delta_str = data.split(":", 2)
+        delta = int(delta_str)
+        with DATA_LOCK:
+            d = next((x for x in DB["dishware"] if x["id"] == item_id), None)
+            if not d:
+                return
+            old_qty = int(d.get("qty", 0))
+            new_qty = old_qty + delta
+            d["qty"] = new_qty
+            DB["dishware_logs"].append({
+                "ts": now_str(),
+                "name": d["name"],
+                "delta": delta,
+                "after": new_qty,
+                "reason": f"кнопка {delta:+d}",
+            })
+            save_data_unlocked(DB)
+        track_user_and_action(call.from_user, f"Посуда «{d['name']}» ({delta:+d}): {old_qty} → {new_qty}")
+        render_dishware_item(chat_id, uid, item_id, edit_msg_id=msg_id)
+        return
+
+    if data.startswith("d_custom:"):
+        if not is_admin(uid):
+            return
+        _, item_id, op = data.split(":", 2)
+        set_state(
+            uid,
+            {
+                "mode": "dishware_adjust",
+                "step": "amount",
+                "data": {"item_id": item_id, "op": op},
+                "return_section": "dishware",
+            },
+        )
+        label = "прибавить (приехала посуда)" if op == "add" else "списать (взяли со склада)"
+        safe_send_text(chat_id, f"Введите количество, которое нужно <b>{label}</b>:", reply_markup=cancel_keyboard())
+        return
+
+    if data.startswith("d_set:"):
+        if not is_admin(uid):
+            return
+        item_id = data.split(":", 1)[1]
+        set_state(
+            uid,
+            {
+                "mode": "dishware_adjust",
+                "step": "amount",
+                "data": {"item_id": item_id, "op": "set"},
+                "return_section": "dishware",
+            },
+        )
+        safe_send_text(chat_id, "Введите новый точный остаток (целое число):", reply_markup=cancel_keyboard())
+        return
+
+    if data.startswith("d_del_ask:"):
+        if not is_admin(uid):
+            return
+        item_id = data.split(":", 1)[1]
+        with DATA_LOCK:
+            d = next((x for x in DB["dishware"] if x["id"] == item_id), None)
+        if not d:
+            return
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"d_del_yes:{item_id}"),
+            types.InlineKeyboardButton("❌ Отмена", callback_data=f"d_view:{item_id}"),
+        )
+        safe_send_text(chat_id, f"Удалить позицию посуды <b>{esc(d.get('name'))}</b>?", reply_markup=kb)
+        return
+
+    if data.startswith("d_del_yes:"):
+        if not is_admin(uid):
+            return
+        item_id = data.split(":", 1)[1]
+        removed_name = ""
+        with DATA_LOCK:
+            kept = []
+            for x in DB["dishware"]:
+                if x["id"] == item_id:
+                    removed_name = x.get("name", "")
+                else:
+                    kept.append(x)
+            DB["dishware"] = kept
+            save_data_unlocked(DB)
+        track_user_and_action(call.from_user, f"Удалил посуду: {removed_name}")
+        safe_send_text(chat_id, f"🗑 Удалено: <b>{esc(removed_name or item_id)}</b>")
+        render_dishware_section(chat_id, uid)
+        return
+
+    if data == "d_logs":
+        if not is_admin(uid):
+            return
+        with DATA_LOCK:
+            logs = list(reversed(DB["dishware_logs"][-25:]))
+        if not logs:
+            text = "<b>📜 История остатков посуды</b>\n\nЗаписей пока нет."
+        else:
+            lines = ["<b>📜 Последние движения посуды:</b>\n"]
+            for lg in logs:
+                lines.append(
+                    f"• <code>{esc(lg['ts'])}</code> — <b>{esc(lg['name'])}</b> "
+                    f"(<code>{int(lg['delta']):+d}</code>, остаток <b>{int(lg['after'])}</b>) [{esc(lg.get('reason', ''))}]"
+                )
+            text = "\n".join(lines)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ К списку посуды", callback_data="sec_open:dishware"))
+        safe_edit_text(chat_id, msg_id, text, reply_markup=kb)
+        return
+
+    # --- Пользователи и логи (только для админа) ---
+    if data == "u_list":
+        if not is_admin(uid):
+            return
+        with DATA_LOCK:
+            count = len(DB["users"])
+        safe_edit_text(
+            chat_id,
+            msg_id,
+            f"<b>📋 Пользователи (всего: {count})</b>\nНажмите на пользователя для подробностей:",
+            reply_markup=users_list_inline(),
+        )
+        return
+
+    if data.startswith("u_one:"):
+        if not is_admin(uid):
+            return
+        target_uid = int(data.split(":", 1)[1])
+        with DATA_LOCK:
+            u = DB["users"].get(str(target_uid))
+            u_logs = [x for x in DB["activity_logs"] if x.get("user_id") == target_uid][-15:]
+
+        if not u:
+            safe_send_text(chat_id, "Пользователь не найден.")
+            return
+
+        lines = [
+            "<b>👤 Карточка пользователя</b>",
+            f"Имя: <b>{esc(u.get('name'))}</b>",
+            f"Username: {esc(u.get('username'))}",
+            f"ID: <code>{u.get('id')}</code>",
+            f"Первый вход: <code>{esc(u.get('first_seen'))}</code>",
+            f"Последняя активность: <code>{esc(u.get('last_seen'))}</code>",
+            f"Всего действий: <b>{int(u.get('actions_count', 0))}</b>",
+            "\n<b>Последние действия:</b>",
+        ]
+        if not u_logs:
+            lines.append("— нет записей")
+        else:
+            for item in reversed(u_logs):
+                lines.append(f"• <code>{esc(item['ts'])}</code> — {esc(item['action'])}")
+
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ К списку пользователей", callback_data="u_list"))
+        safe_edit_text(chat_id, msg_id, "\n".join(lines), reply_markup=kb)
+        return
+
+    if data == "u_logs":
+        if not is_admin(uid):
+            return
+        with DATA_LOCK:
+            recent = list(reversed(DB["activity_logs"][-30:]))
+        if not recent:
+            text = "<b>🕒 Лента действий</b>\n\nПока пусто."
+        else:
+            lines = ["<b>🕒 Последние действия пользователей:</b>\n"]
+            for ev in recent:
+                lines.append(
+                    f"• <code>{esc(ev['ts'])}</code> | <b>{esc(ev['name'])}</b> "
+                    f"({esc(ev['username'])}, <code>{ev['user_id']}</code>): {esc(ev['action'])}"
+                )
+            text = "\n".join(lines)
+            if len(text) > 3900:
+                text = text[:3900] + "\n…"
+
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="sec_open:users"))
+        safe_edit_text(chat_id, msg_id, text, reply_markup=kb)
+        return
+
+    # --- Поддержать проект ---
+    if data == "sup_edit":
+        if not is_admin(uid):
+            return
+        set_state(uid, {"mode": "support_edit", "step": "text", "data": {}, "return_section": "support"})
+        safe_send_text(
+            chat_id,
+            "Введите новый текст для раздела <b>«Поддержать проект»</b>:",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+
+# ==============================================================================
+# ЗАПУСК
+# ==============================================================================
+def run_bot():
+    print("Запуск бота...")
+    while True:
+        try:
+            bot.infinity_polling(
+                skip_pending=False,
+                timeout=25,
+                long_polling_timeout=25,
+                allowed_updates=["message", "callback_query"],
+            )
+        except Exception as e:
+            print(f"[ERROR] polling crashed: {e}")
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    run_bot()
