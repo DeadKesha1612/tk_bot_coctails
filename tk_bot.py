@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import telebot
 from telebot import types
 
-DEFAULT_BOT_TOKEN = "8797743243:AAH27Urfn7hbwHkpsZ_H0NLvhJ6yoGInZag"
+DEFAULT_BOT_TOKEN = "8797743243:AAHdcCLIwfSy-J-doYUFfLqozaxHQ9vaCSk"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
 PORT = int(os.environ.get("PORT", "10000"))
@@ -133,6 +133,26 @@ def default_data() -> dict:
     }
 
 
+def sanitize_recipes_list(raw_items) -> list[dict]:
+    if not isinstance(raw_items, list):
+        return []
+    cleaned = []
+    for idx, it in enumerate(raw_items):
+        if not isinstance(it, dict):
+            continue
+        item_id = str(it.get("id") or uuid.uuid4().hex[:8])
+        title = str(it.get("title") or f"Позиция {idx + 1}").strip() or f"Позиция {idx + 1}"
+        cleaned.append({
+            "id": item_id,
+            "title": title,
+            "ingredients": str(it.get("ingredients") or ""),
+            "method": str(it.get("method") or ""),
+            "photo_path": it.get("photo_path") if isinstance(it.get("photo_path"), str) else None,
+            "created_at": str(it.get("created_at") or now_str()),
+        })
+    return cleaned
+
+
 def load_data() -> dict:
     with DATA_LOCK:
         if not os.path.exists(DATA_FILE):
@@ -145,19 +165,19 @@ def load_data() -> dict:
             if not isinstance(raw, dict):
                 return default_data()
             base = default_data()
+            raw_recipes = raw.get("recipes") if isinstance(raw.get("recipes"), dict) else {}
             for sec in RECIPE_SECTIONS:
-                items = raw.get("recipes", {}).get(sec, [])
-                base["recipes"][sec] = items if isinstance(items, list) else []
+                base["recipes"][sec] = sanitize_recipes_list(raw_recipes.get(sec, []))
             if isinstance(raw.get("dishware"), list):
-                base["dishware"] = raw["dishware"]
+                base["dishware"] = [x for x in raw["dishware"] if isinstance(x, dict)]
             if isinstance(raw.get("dishware_logs"), list):
-                base["dishware_logs"] = raw["dishware_logs"][-300:]
+                base["dishware_logs"] = [x for x in raw["dishware_logs"] if isinstance(x, dict)][-300:]
             if isinstance(raw.get("support"), dict) and isinstance(raw["support"].get("text"), str):
                 base["support"]["text"] = raw["support"]["text"]
             if isinstance(raw.get("users"), dict):
                 base["users"] = raw["users"]
             if isinstance(raw.get("activity_logs"), list):
-                base["activity_logs"] = raw["activity_logs"][-800:]
+                base["activity_logs"] = [x for x in raw["activity_logs"] if isinstance(x, dict)][-800:]
             return base
         except Exception as e:
             print(f"[ERROR] load_data: {e}")
@@ -321,11 +341,15 @@ def recipe_section_inline(section: str, user_id: int) -> types.InlineKeyboardMar
     with DATA_LOCK:
         items = list(DB["recipes"].get(section, []))
 
-    for item in items:
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or f"idx_{idx}")
+        title = str(item.get("title") or "Без названия")
         kb.add(
             types.InlineKeyboardButton(
-                text=f"📄 {item.get('title', 'Без названия')}",
-                callback_data=f"r_view:{section}:{item['id']}",
+                text=f"📄 {title[:60]}",
+                callback_data=f"r_view:{section}:{item_id}",
             )
         )
 
@@ -437,19 +461,23 @@ def support_inline(user_id: int) -> types.InlineKeyboardMarkup | None:
 
 
 def render_recipe_section(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
-    title = RECIPE_SECTIONS[section]
-    with DATA_LOCK:
-        count = len(DB["recipes"].get(section, []))
-    text = (
-        f"<b>{esc(title)}</b>\n"
-        f"Позиций в разделе: <b>{count}</b>\n"
-        + ("<i>Выберите карточку или воспользуйтесь кнопками управления ниже.</i>" if is_admin(user_id) else "<i>Выберите позицию для просмотра.</i>")
-    )
-    kb = recipe_section_inline(section, user_id)
-    if edit_msg_id:
-        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
-    else:
-        safe_send_text(chat_id, text, reply_markup=kb)
+    try:
+        title = RECIPE_SECTIONS[section]
+        with DATA_LOCK:
+            count = len(DB["recipes"].get(section, []))
+        text = (
+            f"<b>{esc(title)}</b>\n"
+            f"Позиций в разделе: <b>{count}</b>\n"
+            + ("<i>Выберите карточку или воспользуйтесь кнопками управления ниже.</i>" if is_admin(user_id) else "<i>Выберите позицию для просмотра.</i>")
+        )
+        kb = recipe_section_inline(section, user_id)
+        if edit_msg_id:
+            safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
+        else:
+            safe_send_text(chat_id, text, reply_markup=kb)
+    except Exception as e:
+        print(f"[ERROR] render_recipe_section({section}): {e}")
+        safe_send_text(chat_id, f"Ошибка при открытии раздела «{esc(RECIPE_SECTIONS.get(section, section))}».", reply_markup=main_menu_keyboard(user_id))
 
 
 def render_dishware_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
@@ -817,7 +845,7 @@ def handle_wizard_input(message: types.Message):
             else:
                 safe_send_text(
                     message.chat.id,
-                    "Отправьте новое фото/файл или нажмите <b>«⏭ Пропустить»</b> чтобы убрать картинку.",
+                    "Отправьте новое фото/файл или нажмите <b>«⏭ Пропустить»</b> чтобы удалить картинку.",
                     reply_markup=skip_or_cancel_keyboard(),
                 )
                 return
@@ -1375,7 +1403,7 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print("[NEW BUILD v3] Запуск бота...")
+    print("[NEW BUILD v4] Запуск бота...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
