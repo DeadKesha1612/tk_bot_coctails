@@ -11,9 +11,6 @@ from datetime import datetime
 import telebot
 from telebot import types
 
-# ==============================================================================
-# КОНФИГУРАЦИЯ
-# ==============================================================================
 DEFAULT_BOT_TOKEN = "8797743243:AAH27Urfn7hbwHkpsZ_H0NLvhJ6yoGInZag"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
@@ -32,10 +29,7 @@ DATA_LOCK = threading.RLock()
 STATE_LOCK = threading.RLock()
 ALBUM_LOCK = threading.RLock()
 
-# Состояния пошагового ввода по user_id: {user_id: {"mode": ..., "step": ..., "data": ...}}
 USER_STATES = {}
-
-# Буфер медиагрупп (альбомов): {media_group_id: {"messages": [...], "timer": Timer}}
 ALBUM_BUFFER = {}
 
 RECIPE_SECTIONS = {
@@ -146,11 +140,6 @@ def save_data_unlocked(data: dict) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, DATA_FILE)
-
-
-def save_data(data: dict) -> None:
-    with DATA_LOCK:
-        save_data_unlocked(data)
 
 
 DB = load_data()
@@ -270,9 +259,6 @@ def remove_file_if_exists(path: str | None) -> None:
             pass
 
 
-# ==============================================================================
-# КЛАВИАТУРЫ
-# ==============================================================================
 def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton(BTN_AUTHOR), types.KeyboardButton(BTN_CLASSIC))
@@ -421,9 +407,6 @@ def support_inline(user_id: int) -> types.InlineKeyboardMarkup | None:
     return kb
 
 
-# ==============================================================================
-# ОТРИСОВКА РАЗДЕЛОВ
-# ==============================================================================
 def render_recipe_section(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
     title = RECIPE_SECTIONS[section]
     with DATA_LOCK:
@@ -522,11 +505,7 @@ def open_section_by_key(chat_id: int, user_id: int, section: str, edit_msg_id: i
             render_users_section(chat_id, user_id, edit_msg_id=edit_msg_id)
 
 
-# ==============================================================================
-# МАССОВАЯ ЗАГРУЗКА ФАЙЛОВ И АЛЬБОМОВ
-# ==============================================================================
 def extract_media_payload(msg: types.Message) -> tuple[bytes | None, str | None, str | None]:
-    """Возвращает (bytes, ext, original_filename) если сообщение содержит фото или картинку-документ."""
     if msg.content_type == "photo" and msg.photo:
         file_info = bot.get_file(msg.photo[-1].file_id)
         raw = bot.download_file(file_info.file_path)
@@ -651,9 +630,6 @@ def enqueue_bulk_message(message: types.Message, sec: str) -> None:
             timer.start()
 
 
-# ==============================================================================
-# КОМАНДЫ И ГЛАВНОЕ МЕНЮ
-# ==============================================================================
 @bot.message_handler(commands=["start", "menu", "cancel"])
 def cmd_start_or_cancel(message: types.Message):
     uid = message.from_user.id
@@ -699,9 +675,6 @@ def handle_main_menu_buttons(message: types.Message):
     open_section_by_key(message.chat.id, uid, sec)
 
 
-# ==============================================================================
-# ОБРАБОТЧИК ПОШАГОВОГО ВВОДА (ТОЛЬКО ДЛЯ АДМИНА)
-# ==============================================================================
 @bot.message_handler(content_types=["text", "photo", "document"], func=lambda m: get_state(m.from_user.id) is not None)
 def handle_wizard_input(message: types.Message):
     uid = message.from_user.id
@@ -971,9 +944,6 @@ def handle_wizard_input(message: types.Message):
         return
 
 
-# ==============================================================================
-# INLINE CALLBACKS
-# ==============================================================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call: types.CallbackQuery):
     uid = call.from_user.id
@@ -1374,11 +1344,13 @@ def handle_callbacks(call: types.CallbackQuery):
         return
 
 
-# ==============================================================================
-# ЗАПУСК
-# ==============================================================================
 def run_bot():
-    print("Запуск бота...")
+    print("[NEW BUILD v2] Запуск бота...")
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
+    time.sleep(2)
     while True:
         try:
             bot.infinity_polling(
