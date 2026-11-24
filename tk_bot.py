@@ -21,6 +21,8 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
 PORT = int(os.environ.get("PORT", "10000"))
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[: -len("/rest/v1")]
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +40,7 @@ STATE_LOCK = threading.RLock()
 FILE_LOCK = threading.RLock()
 
 USER_STATES = {}
+LAST_SYNC_TS = 0.0
 
 RECIPE_SECTIONS = {
     "author": "Авторские",
@@ -91,10 +94,10 @@ def start_health_server() -> None:
     def _serve():
         try:
             server = ThreadingHTTPServer(("0.0.0.0", PORT), _HealthHandler)
-            print(f"[WEB] Listening on port {PORT}")
+            print(f"[WEB] Listening on port {PORT}", flush=True)
             server.serve_forever()
         except Exception as e:
-            print(f"[WARN] health server error: {e}")
+            print(f"[WARN] health server error: {e}", flush=True)
 
     threading.Thread(target=_serve, daemon=True).start()
 
@@ -138,10 +141,10 @@ def sb_request(method: str, path: str, payload=None, prefer: str | None = None):
             err_txt = e.read().decode("utf-8")[:250]
         except Exception:
             pass
-        print(f"[WARN] Supabase {method} {path} HTTP {e.code}: {err_txt}")
+        print(f"[WARN] Supabase {method} {path} HTTP {e.code}: {err_txt}", flush=True)
         return None
     except Exception as e:
-        print(f"[WARN] Supabase {method} {path} error: {e}")
+        print(f"[WARN] Supabase {method} {path} error: {e}", flush=True)
         return None
 
 
@@ -196,7 +199,7 @@ def save_local_snapshot(snapshot: dict) -> None:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
             os.replace(tmp, DATA_FILE)
         except Exception as e:
-            print(f"[WARN] save_local_snapshot error: {e}")
+            print(f"[WARN] save_local_snapshot error: {e}", flush=True)
 
 
 def sync_local_from_memory() -> None:
@@ -229,34 +232,46 @@ def load_local_snapshot() -> dict:
         if isinstance(raw.get("activity_logs"), list):
             data["activity_logs"] = raw["activity_logs"]
     except Exception as e:
-        print(f"[WARN] load_local_snapshot error: {e}")
+        print(f"[WARN] load_local_snapshot error: {e}", flush=True)
     return data
 
 
 def load_data() -> dict:
+    global LAST_SYNC_TS
     with DATA_LOCK:
         data = load_local_snapshot()
         if not sb_enabled():
             return data
 
         recipe_rows = sb_select("tk_recipes", "order=created_at.asc")
-        if recipe_rows:
+        if recipe_rows is not None:
             data["recipes"] = {k: [] for k in RECIPE_SECTIONS}
             for r in recipe_rows:
                 sec = r.get("section")
-                if sec in data["recipes"]:
-                    data["recipes"][sec].append({
-                        "id": str(r.get("id")),
-                        "title": str(r.get("title") or "Без названия"),
-                        "ingredients": str(r.get("ingredients") or ""),
-                        "method": str(r.get("method") or ""),
-                        "photo_path": r.get("photo_path"),
-                        "photo_file_id": r.get("photo_file_id"),
-                        "created_at": str(r.get("created_at") or now_str()),
-                    })
+                if sec not in data["recipes"]:
+                    # Если раздел написан по-русски (например "Коктейли" при ручном INSERT),
+                    # кладём в classic, чтобы рецепт всё равно отображался и находился
+                    sec_lower = str(sec or "").strip().lower()
+                    sec_map = {
+                        "авторские": "author",
+                        "классические": "classic",
+                        "коктейли": "classic",
+                        "коктейли меню": "menu_cocktails",
+                        "наливки": "tinctures",
+                    }
+                    sec = sec_map.get(sec_lower, "classic")
+                data["recipes"][sec].append({
+                    "id": str(r.get("id")),
+                    "title": str(r.get("title") or "Без названия"),
+                    "ingredients": str(r.get("ingredients") or ""),
+                    "method": str(r.get("method") or ""),
+                    "photo_path": r.get("photo_path"),
+                    "photo_file_id": r.get("photo_file_id"),
+                    "created_at": str(r.get("created_at") or now_str()),
+                })
 
         dish_rows = sb_select("tk_dishware", "order=name.asc")
-        if dish_rows:
+        if dish_rows is not None:
             data["dishware"] = [
                 {
                     "id": str(d.get("id")),
@@ -269,7 +284,7 @@ def load_data() -> dict:
             ]
 
         dlog_rows = sb_select("tk_dishware_logs", "order=id.desc&limit=300")
-        if dlog_rows:
+        if dlog_rows is not None:
             data["dishware_logs"] = list(reversed(dlog_rows))
 
         sup_rows = sb_select("tk_support", "id=eq.main&limit=1")
@@ -277,7 +292,7 @@ def load_data() -> dict:
             data["support"]["text"] = sup_rows[0]["text"]
 
         user_rows = sb_select("tk_users", "order=last_seen.desc")
-        if user_rows:
+        if user_rows is not None:
             for u in user_rows:
                 uid_str = str(u.get("uid") or u.get("id"))
                 data["users"][uid_str] = {
@@ -290,14 +305,25 @@ def load_data() -> dict:
                 }
 
         act_rows = sb_select("tk_activity_logs", "order=id.desc&limit=800")
-        if act_rows:
+        if act_rows is not None:
             data["activity_logs"] = list(reversed(act_rows))
 
+        LAST_SYNC_TS = time.time()
         save_local_snapshot(data)
         return data
 
 
 DB = load_data()
+
+
+def refresh_from_supabase_if_needed(force: bool = False) -> None:
+    global DB
+    if not sb_enabled():
+        return
+    if force or (time.time() - LAST_SYNC_TS > 15):
+        fresh = load_data()
+        with DATA_LOCK:
+            DB = fresh
 
 
 def set_state(user_id: int, state: dict | None) -> None:
@@ -406,6 +432,7 @@ def track_user_and_action(user, action_text: str) -> None:
 
 
 def search_entries(raw_query: str) -> list[dict]:
+    refresh_from_supabase_if_needed()
     cleaned = re.sub(r"\s+", " ", (raw_query or "").strip().lower())
     without_word = re.sub(r"^(коктейль|коктейли|рецепт|наливка|наливки)\s+", "", cleaned).strip()
     target = without_word if without_word else cleaned
@@ -461,7 +488,7 @@ def safe_send_text(chat_id: int, text: str, reply_markup=None) -> None:
         try:
             bot.send_message(chat_id, plain, reply_markup=reply_markup, parse_mode=None, disable_web_page_preview=True)
         except Exception as e:
-            print(f"[ERROR] safe_send_text: {e}")
+            print(f"[ERROR] safe_send_text: {e}", flush=True)
 
 
 def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None) -> None:
@@ -501,7 +528,7 @@ def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
                 safe_send_text(chat_id, caption, reply_markup=reply_markup)
             return
         except Exception as e:
-            print(f"[WARN] send_photo by file_id failed: {e}")
+            print(f"[WARN] send_photo by file_id failed: {e}", flush=True)
 
     if photo_path and os.path.isfile(photo_path):
         try:
@@ -516,7 +543,7 @@ def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
                 sync_local_from_memory()
             return
         except Exception as e:
-            print(f"[WARN] send_photo failed: {e}")
+            print(f"[WARN] send_photo failed: {e}", flush=True)
 
     safe_send_text(chat_id, caption, reply_markup=reply_markup)
 
@@ -614,6 +641,7 @@ def dishware_item_inline(item_id: str, user_id: int) -> types.InlineKeyboardMark
 
 
 def render_recipe_section(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
+    refresh_from_supabase_if_needed()
     title = RECIPE_SECTIONS[section]
     with DATA_LOCK:
         count = len(DB["recipes"].get(section, []))
@@ -626,6 +654,7 @@ def render_recipe_section(chat_id: int, user_id: int, section: str, edit_msg_id:
 
 
 def render_dishware_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
+    refresh_from_supabase_if_needed()
     with DATA_LOCK:
         items = list(DB["dishware"])
     if not items:
@@ -718,10 +747,11 @@ def extract_media(msg: types.Message) -> tuple[bytes | None, str | None, str | N
 def cmd_start_or_cancel(message: types.Message):
     uid = message.from_user.id
     set_state(uid, None)
+    refresh_from_supabase_if_needed(force=True)
     track_user_and_action(message.from_user, "start/menu")
     safe_send_text(
         message.chat.id,
-        "<b>Главное меню</b>\nВыберите раздел или напишите слово для поиска (например: <code>Алексей</code>):",
+        "<b>Главное меню</b>\nВыберите раздел или напишите слово для поиска (например: <code>негрони</code>):",
         reply_markup=main_menu_keyboard(uid),
     )
 
@@ -911,12 +941,16 @@ def handle_wizard_input(message: types.Message):
         return
 
 
-@bot.message_handler(content_types=["text"], func=lambda m: get_state(m.from_user.id) is None and not (m.text or "").startswith("/"))
+@bot.message_handler(content_types=["text"], func=lambda m: not (m.text or "").startswith("/"))
 def handle_text_search(message: types.Message):
     uid = message.from_user.id
     query = (message.text or "").strip()
+    print(f"[TEXT_SEARCH] uid={uid} chat={message.chat.id} state={get_state(uid)} query={query!r}", flush=True)
     if not query:
         return
+    if get_state(uid) is not None:
+        return
+
     matches = search_entries(query)
     if not matches:
         safe_send_text(
@@ -1047,12 +1081,12 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print(f"[NEW BUILD v10.2] Запуск бота (supabase: {sb_enabled()})...")
+    print(f"[NEW BUILD v10.3] Запуск бота (supabase: {sb_enabled()})...", flush=True)
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    time.sleep(2)
+    time.sleep(3)
     while True:
         try:
             bot.infinity_polling(
@@ -1064,10 +1098,10 @@ def run_bot():
         except Exception as e:
             err_s = str(e)
             if "409" in err_s:
-                print("[WARN] 409 Conflict, ждём 6 сек...")
-                time.sleep(6)
+                print("[WARN] 409 Conflict, ждём 8 сек...", flush=True)
+                time.sleep(8)
             else:
-                print(f"[ERROR] polling crashed: {e}")
+                print(f"[ERROR] polling crashed: {e}", flush=True)
                 time.sleep(3)
 
 
