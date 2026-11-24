@@ -152,7 +152,7 @@ def sb_request(method: str, path: str, payload=None, prefer: str | None = None):
     except urllib.error.HTTPError as e:
         err_txt = ""
         try:
-            err_txt = e.read().decode("utf-8")[:300]
+            err_txt = e.read().decode("utf-8")[:250]
         except Exception:
             pass
         print(f"[WARN] Supabase {method} {path} HTTP {e.code}: {err_txt}")
@@ -255,11 +255,10 @@ def load_data() -> dict:
     with DATA_LOCK:
         data = load_local_snapshot()
         if not sb_enabled():
-            print("[INFO] Работаем в локальном режиме (bot_data.json)")
             return data
 
         recipe_rows = sb_select("tk_recipes", "order=created_at.asc")
-        if recipe_rows is not None and len(recipe_rows) > 0:
+        if recipe_rows:
             data["recipes"] = {k: [] for k in RECIPE_SECTIONS}
             for r in recipe_rows:
                 sec = r.get("section")
@@ -275,7 +274,7 @@ def load_data() -> dict:
                     })
 
         dish_rows = sb_select("tk_dishware", "order=name.asc")
-        if dish_rows is not None and len(dish_rows) > 0:
+        if dish_rows:
             data["dishware"] = [
                 {
                     "id": str(d.get("id")),
@@ -288,7 +287,7 @@ def load_data() -> dict:
             ]
 
         dlog_rows = sb_select("tk_dishware_logs", "order=id.desc&limit=300")
-        if dlog_rows is not None and len(dlog_rows) > 0:
+        if dlog_rows:
             data["dishware_logs"] = list(reversed(dlog_rows))
 
         sup_rows = sb_select("tk_support", "id=eq.main&limit=1")
@@ -296,7 +295,7 @@ def load_data() -> dict:
             data["support"]["text"] = sup_rows[0]["text"]
 
         user_rows = sb_select("tk_users", "order=last_seen.desc")
-        if user_rows is not None and len(user_rows) > 0:
+        if user_rows:
             for u in user_rows:
                 uid_str = str(u.get("uid") or u.get("id"))
                 data["users"][uid_str] = {
@@ -309,7 +308,7 @@ def load_data() -> dict:
                 }
 
         act_rows = sb_select("tk_activity_logs", "order=id.desc&limit=800")
-        if act_rows is not None and len(act_rows) > 0:
+        if act_rows:
             data["activity_logs"] = list(reversed(act_rows))
 
         save_local_snapshot(data)
@@ -468,6 +467,20 @@ def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None) 
         )
     except Exception:
         safe_send_text(chat_id, text, reply_markup=reply_markup)
+
+
+def pin_media_to_telegram(chat_id: int, raw_bytes: bytes | None, file_id: str | None, caption: str = "") -> str | None:
+    if file_id:
+        return file_id
+    if not raw_bytes:
+        return None
+    try:
+        sent = bot.send_photo(chat_id, raw_bytes, caption=caption[:1024] if caption else None)
+        if sent and sent.photo:
+            return sent.photo[-1].file_id
+    except Exception as e:
+        print(f"[WARN] pin_media_to_telegram failed: {e}")
+    return None
 
 
 def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
@@ -793,7 +806,7 @@ def extract_media_payload(msg: types.Message) -> tuple[bytes | None, str | None,
         if ext in (".png", ".jpg", ".jpeg", ".webp") or mime.startswith("image/"):
             file_info = bot.get_file(doc.file_id)
             raw = bot.download_file(file_info.file_path)
-            return raw, ext or ".png", orig_name, doc.file_id
+            return raw, ext or ".png", orig_name, None
 
     return None, None, None, None
 
@@ -829,13 +842,15 @@ def commit_bulk_messages(uid: int, chat_id: int, sec: str, msgs: list[types.Mess
             else:
                 title = fallback_title
 
+            pinned_file_id = pin_media_to_telegram(chat_id, raw_bytes, file_id, caption=title)
+
             new_item = {
                 "id": item_id,
                 "title": title,
                 "ingredients": "",
                 "method": "",
                 "photo_path": photo_path,
-                "photo_file_id": file_id,
+                "photo_file_id": pinned_file_id,
                 "created_at": now_str(),
             }
             DB["recipes"].setdefault(sec, []).append(new_item)
@@ -1011,6 +1026,7 @@ def handle_wizard_input(message: types.Message):
                 photo_path = os.path.join(MEDIA_DIR, f"{sec}_{item_id}{safe_ext}")
                 with open(photo_path, "wb") as f:
                     f.write(raw_bytes)
+                file_id = pin_media_to_telegram(message.chat.id, raw_bytes, file_id, caption=data["title"])
             elif txt == "⏭ Пропустить":
                 photo_path = None
             else:
@@ -1059,7 +1075,7 @@ def handle_wizard_input(message: types.Message):
                 new_photo = os.path.join(MEDIA_DIR, f"{sec}_{item_id}_{uuid.uuid4().hex[:4]}{safe_ext}")
                 with open(new_photo, "wb") as f:
                     f.write(raw_bytes)
-                new_file_id = file_id
+                new_file_id = pin_media_to_telegram(message.chat.id, raw_bytes, file_id)
             else:
                 safe_send_text(
                     message.chat.id,
@@ -1625,12 +1641,12 @@ def handle_callbacks(call: types.CallbackQuery):
 
 def run_bot():
     start_health_server()
-    print(f"[NEW BUILD v9.2] Запуск бота (supabase: {sb_enabled()})...")
+    print(f"[NEW BUILD v10.0] Запуск бота (supabase: {sb_enabled()})...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    time.sleep(2)
+    time.sleep(3)
     while True:
         try:
             bot.infinity_polling(
@@ -1640,8 +1656,13 @@ def run_bot():
                 allowed_updates=["message", "callback_query"],
             )
         except Exception as e:
-            print(f"[ERROR] polling crashed: {e}")
-            time.sleep(3)
+            err_s = str(e)
+            if "409" in err_s:
+                print("[WARN] 409 Conflict при пересменке инстанса, ждём 6 сек...")
+                time.sleep(6)
+            else:
+                print(f"[ERROR] polling crashed: {e}")
+                time.sleep(3)
 
 
 if __name__ == "__main__":
