@@ -43,16 +43,17 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 # =========================================================
 # КНОПКИ И СПИСКИ
 # =========================================================
-BTN_RECIPES = "рецепты"
-BTN_DISHWARE = "посуда"
-BTN_HELP = "помощь"
-BTN_USERS = "пользователи"
-BTN_SUPPORT = "поддержка"
+BTN_RECIPES = "🍸 Рецепты"
+BTN_DISHWARE = "🥃 Посуда"
+BTN_HELP = "🆘 Помощь"
+BTN_USERS = "👥 Пользователи"
+BTN_SUPPORT = "💛 Поддержка"
 
-BTN_REC_AUTHOR = "авторские"
-BTN_REC_CLASSIC = "классические"
-BTN_REC_INFUSIONS = "наливки"
-BTN_REC_MENU = "коктейли меню"
+BTN_REC_AUTHOR = "✨ Авторские"
+BTN_REC_CLASSIC = "🥃 Классические"
+BTN_REC_INFUSIONS = "🫙 Наливки"
+BTN_REC_MENU = "🍹 Коктейли меню"
+BTN_MEDIA_LIST = "🖼 Карточки"
 
 BTN_BULK_MEDIA = "📥 Массовая загрузка"
 BTN_DISH_SUMMARY = "📊 Подсчёт остатков"
@@ -162,6 +163,7 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton(BTN_REC_AUTHOR), types.KeyboardButton(BTN_REC_CLASSIC))
     kb.row(types.KeyboardButton(BTN_REC_INFUSIONS), types.KeyboardButton(BTN_REC_MENU))
+    kb.row(types.KeyboardButton(BTN_MEDIA_LIST))
     if is_admin(user_id):
         kb.row(types.KeyboardButton(BTN_BULK_MEDIA))
     kb.row(types.KeyboardButton(BTN_BACK))
@@ -187,7 +189,7 @@ def dishware_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     return kb
 
 
-def dishware_item_keyboard(item_name: str) -> types.ReplyKeyboardMarkup:
+def dishware_item_keyboard() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton("+1"), types.KeyboardButton("-1"))
     kb.row(types.KeyboardButton("+5"), types.KeyboardButton("-5"))
@@ -341,6 +343,7 @@ def load_data() -> None:
                 {
                     "id": str(m.get("id")),
                     "title": str(m.get("title") or ""),
+                    "category": str(m.get("category") or ""),
                     "photo_file_id": m.get("photo_file_id"),
                     "photo_path": m.get("photo_path"),
                     "created_at": str(m.get("created_at") or now_str()),
@@ -382,8 +385,6 @@ def touch_user(msg: types.Message) -> None:
         row = {
             "user_id": uid,
             "username": user.username or "",
-            "first_name": user.first_name or "",
-            "last_name": user.last_name or "",
             "is_admin": bool(existing.get("is_admin")) if existing else (uid == ADMIN_ID),
             "last_seen": now_str(),
         }
@@ -486,7 +487,7 @@ def persist_media_card(card: dict) -> None:
     )
 
 
-def save_incoming_media_card(msg: types.Message) -> tuple[bool, dict | str]:
+def save_incoming_media_card(msg: types.Message, active_category: str = "") -> tuple[bool, dict | str]:
     exact_title = exact_title_from_message(msg)
     if not exact_title:
         return False, "Не удалось определить имя файла — отправьте PNG как файл/документ (или добавьте подпись)."
@@ -523,6 +524,7 @@ def save_incoming_media_card(msg: types.Message) -> tuple[bool, dict | str]:
     card = {
         "id": card_id,
         "title": exact_title,
+        "category": active_category,
         "photo_file_id": file_id,
         "photo_path": local_path,
         "created_at": now_str(),
@@ -535,6 +537,8 @@ def save_incoming_media_card(msg: types.Message) -> tuple[bool, dict | str]:
             existing["photo_file_id"] = card["photo_file_id"]
             existing["photo_path"] = card["photo_path"]
             existing["created_at"] = card["created_at"]
+            if active_category:
+                existing["category"] = active_category
             card = existing
         else:
             cards.append(card)
@@ -586,24 +590,56 @@ def find_media_matches(query: str) -> list[dict]:
 # =========================================================
 # РЕЦЕПТЫ, ПОМОЩЬ, ПОЛЬЗОВАТЕЛИ, ПОДДЕРЖКА
 # =========================================================
-def show_recipe_category(msg: types.Message, category_key: str) -> None:
+def show_recipe_category(msg: types.Message, category_label: str) -> None:
     uid = msg.from_user.id
+    clean_cat = norm_text(re.sub(r"^[^\wа-яё]+\s*", "", category_label, flags=re.I))
+
     with DATA_LOCK:
         recipes = [
             r for r in DB.get("recipes", [])
-            if norm_text(r.get("category") or r.get("type") or "") == norm_text(category_key)
+            if norm_text(r.get("category") or r.get("type") or "") == clean_cat
         ]
-    if not recipes:
+        cards = list(DB.get("media_cards", []))
+
+    cat_cards = [c for c in cards if norm_text(c.get("category")) == clean_cat]
+    display_cards = cat_cards if cat_cards else (cards if not recipes else [])
+
+    lines = []
+    for r in recipes[:40]:
+        lines.append(f"• <b>{esc(r.get('name') or r.get('title') or 'Без названия')}</b>")
+    for c in display_cards[:40]:
+        lines.append(f"• 🖼 <b>{esc(c.get('title') or '')}</b>")
+
+    if not lines:
         safe_send_text(
             msg.chat.id,
-            f"Раздел <b>{esc(category_key)}</b> пока пуст.",
+            f"Раздел <b>{esc(category_label)}</b> пока пуст.",
             reply_markup=recipes_menu_keyboard(uid),
         )
         return
-    lines = [f"• <b>{esc(r.get('name') or r.get('title') or 'Без названия')}</b>" for r in recipes[:40]]
+
     safe_send_text(
         msg.chat.id,
-        f"🍸 <b>{esc(category_key)}</b> ({len(recipes)}):\n\n" + "\n".join(lines),
+        f"<b>{esc(category_label)}</b> ({len(lines)}):\n\n"
+        + "\n".join(lines)
+        + "\n\n<i>Напиши название текстом, чтобы получить файл/карточку.</i>",
+        reply_markup=recipes_menu_keyboard(uid),
+    )
+
+
+def show_media_cards_list(msg: types.Message) -> None:
+    uid = msg.from_user.id
+    with DATA_LOCK:
+        cards = list(DB.get("media_cards", []))
+    if not cards:
+        safe_send_text(msg.chat.id, "Сохранённых карточек пока нет.", reply_markup=recipes_menu_keyboard(uid))
+        return
+    lines = [f"• <b>{esc(c.get('title') or '')}</b>" for c in cards[:60]]
+    safe_send_text(
+        msg.chat.id,
+        f"🖼 <b>Карточки ({len(cards)}):</b>\n\n"
+        + "\n".join(lines)
+        + "\n\n<i>Напиши название текстом, чтобы получить файл.</i>",
         reply_markup=recipes_menu_keyboard(uid),
     )
 
@@ -620,9 +656,8 @@ def show_users_and_actions(msg: types.Message) -> None:
     user_lines = []
     for u in users:
         uname = f"@{u.get('username')}" if u.get("username") else "без username"
-        name = u.get("first_name") or ""
         user_lines.append(
-            f"• {esc(name)} ({esc(uname)}, id <code>{esc(u.get('user_id'))}</code>) — {esc(u.get('last_seen') or '')}"
+            f"• {esc(uname)} (id <code>{esc(u.get('user_id'))}</code>) — {esc(u.get('last_seen') or '')}"
         )
 
     action_lines = []
@@ -651,18 +686,23 @@ def send_support_link(msg: types.Message) -> None:
     kb.add(types.InlineKeyboardButton("💛 Поддержать на DonationAlerts", url=url))
     safe_send_text(
         msg.chat.id,
-        f"💛 <b>Поддержка проекта</b>\nСсылка: {esc(url)}",
+        f"💛 <b>Поддержка проекта</b>\n{esc(url)}",
         reply_markup=kb,
     )
-    safe_send_text(msg.chat.id, "Нажми кнопку выше или выбери раздел:", reply_markup=main_menu_keyboard(uid))
+    safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
 
 
-def start_bulk_mode(msg: types.Message) -> None:
+def start_bulk_mode(msg: types.Message, active_category: str = "") -> None:
     uid = msg.from_user.id
     if not is_admin(uid):
         safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
         return
-    USER_STATES[uid] = {"mode": "media_bulk_add", "count": 0, "titles": []}
+    USER_STATES[uid] = {
+        "mode": "media_bulk_add",
+        "count": 0,
+        "titles": [],
+        "category": active_category,
+    }
     safe_send_text(
         msg.chat.id,
         "📥 <b>Режим массовой загрузки файлов/PNG включён.</b>\n\n"
@@ -716,8 +756,9 @@ def handle_media_upload(msg: types.Message):
     touch_user(msg)
     uid = msg.from_user.id
     st = USER_STATES.get(uid) or {}
+    active_cat = str(st.get("category") or "")
 
-    ok, res = save_incoming_media_card(msg)
+    ok, res = save_incoming_media_card(msg, active_category=active_cat)
     if not ok:
         safe_send_text(msg.chat.id, f"⚠️ {esc(res)}")
         return
@@ -781,13 +822,10 @@ def handle_text(msg: types.Message):
             f"{esc(text)}"
         )
         for aid in admins:
-            if aid != uid:
-                safe_send_text(aid, report)
-        if uid in admins:
-            safe_send_text(uid, report)
+            safe_send_text(aid, report)
         safe_send_text(
             msg.chat.id,
-            "✅ Запрос отправлен администратору. Спасибо!",
+            "✅ Запрос отправлен администратору.",
             reply_markup=main_menu_keyboard(uid),
         )
         return
@@ -796,11 +834,12 @@ def handle_text(msg: types.Message):
         item_id = st.get("item_id")
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
-            safe_send_text(msg.chat.id, "Раздел «посуда»:", reply_markup=dishware_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, "🥃 Посуда:", reply_markup=dishware_menu_keyboard(uid))
             return
         if text == BTN_DISH_SUMMARY:
-            safe_send_text(msg.chat.id, format_dishware_summary(), reply_markup=dishware_item_keyboard(st.get("name") or ""))
+            safe_send_text(msg.chat.id, format_dishware_summary(), reply_markup=dishware_item_keyboard())
             return
+
         delta = None
         exact = None
         if text in ("+1", "-1", "+5", "-5"):
@@ -813,11 +852,10 @@ def handle_text(msg: types.Message):
         if delta is not None or exact is not None:
             updated = adjust_dishware_qty(item_id, delta, exact, uid, username)
             if updated:
-                st["name"] = updated.get("name") or ""
                 safe_send_text(
                     msg.chat.id,
                     f"🥃 <b>{esc(updated.get('name'))}</b>: <b>{int(updated.get('qty') or 0)}шт</b>",
-                    reply_markup=dishware_item_keyboard(st["name"]),
+                    reply_markup=dishware_item_keyboard(),
                 )
             return
 
@@ -830,17 +868,22 @@ def handle_text(msg: types.Message):
         start_bulk_mode(msg)
         return
 
-    if low == BTN_RECIPES:
+    if text == BTN_MEDIA_LIST:
+        log_activity(uid, username, "OPEN_CARDS")
+        show_media_cards_list(msg)
+        return
+
+    if text == BTN_RECIPES or low == "рецепты":
         log_activity(uid, username, "OPEN_RECIPES")
         safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
         return
 
-    if low in (BTN_REC_AUTHOR, BTN_REC_CLASSIC, BTN_REC_INFUSIONS, BTN_REC_MENU):
-        log_activity(uid, username, "RECIPES_CAT", low)
-        show_recipe_category(msg, low)
+    if text in (BTN_REC_AUTHOR, BTN_REC_CLASSIC, BTN_REC_INFUSIONS, BTN_REC_MENU):
+        log_activity(uid, username, "RECIPES_CAT", text)
+        show_recipe_category(msg, text)
         return
 
-    if low == BTN_DISHWARE:
+    if text == BTN_DISHWARE or low == "посуда":
         USER_STATES.pop(uid, None)
         log_activity(uid, username, "OPEN_DISHWARE")
         safe_send_text(msg.chat.id, "🥃 Выбери позицию посуды:", reply_markup=dishware_menu_keyboard(uid))
@@ -862,25 +905,25 @@ def handle_text(msg: types.Message):
             msg.chat.id,
             f"🥃 <b>{esc(matched_dish.get('name'))}</b> — сейчас <b>{int(matched_dish.get('qty') or 0)}шт</b>.\n"
             "Нажми <b>+1 / -1 / +5 / -5</b> или отправь число (например, <code>+10</code>, <code>-3</code> или <code>24</code>).",
-            reply_markup=dishware_item_keyboard(matched_dish.get("name") or ""),
+            reply_markup=dishware_item_keyboard(),
         )
         return
 
-    if low == BTN_HELP:
+    if text == BTN_HELP or low == "помощь":
         USER_STATES[uid] = {"mode": "help_wait_text"}
         safe_send_text(
             msg.chat.id,
-            "🆘 Опиши проблему текстом и отправь сообщение — я передам его администратору.",
+            "🆘 Опиши проблему текстом и отправь сообщение — запрос придёт администратору.",
             reply_markup=back_only_keyboard(),
         )
         return
 
-    if low == BTN_USERS:
+    if text == BTN_USERS or low == "пользователи":
         log_activity(uid, username, "OPEN_USERS")
         show_users_and_actions(msg)
         return
 
-    if low == BTN_SUPPORT:
+    if text == BTN_SUPPORT or low == "поддержка":
         log_activity(uid, username, "OPEN_SUPPORT")
         send_support_link(msg)
         return
@@ -922,7 +965,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.6] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
+    print(f"[NEW BUILD v10.7] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
