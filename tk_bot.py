@@ -1,8 +1,10 @@
 import copy
 import html
+import io
 import json
 import os
 import re
+import textwrap
 import threading
 import time
 import urllib.error
@@ -14,6 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import telebot
 from telebot import types
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 # =========================================================
 # КОНФИГУРАЦИЯ
@@ -55,6 +64,7 @@ BTN_REC_CLASSIC = "🥃 Классические"
 BTN_REC_INFUSIONS = "🫙 Наливки"
 BTN_REC_MENU = "🍹 Коктейли меню"
 BTN_MEDIA_LIST = "🖼 Карточки"
+BTN_ADD_TTK_TEXT = "➕ Добавить ТТК текстом"
 BTN_MANAGE_TTK = "✏️ Ред. / Удалить ТТК"
 
 BTN_BULK_MEDIA = "📥 Массовая загрузка"
@@ -164,7 +174,6 @@ def safe_send_text(chat_id: int, text: str, reply_markup=None):
 
 
 def parse_number_selection(raw: str, max_index: int) -> list[int]:
-    """Разбирает строку вроде '1, 3, 5' или '1-3, 7' в список индексов (1..max_index)."""
     cleaned = (raw or "").strip()
     if not re.fullmatch(r"[\d\s,\-]+", cleaned):
         return []
@@ -209,7 +218,7 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton(BTN_REC_AUTHOR), types.KeyboardButton(BTN_REC_CLASSIC))
     kb.row(types.KeyboardButton(BTN_REC_INFUSIONS), types.KeyboardButton(BTN_REC_MENU))
-    kb.row(types.KeyboardButton(BTN_MEDIA_LIST))
+    kb.row(types.KeyboardButton(BTN_MEDIA_LIST), types.KeyboardButton(BTN_ADD_TTK_TEXT))
     if is_admin(user_id):
         kb.row(types.KeyboardButton(BTN_MANAGE_TTK), types.KeyboardButton(BTN_BULK_MEDIA))
     kb.row(types.KeyboardButton(BTN_BACK))
@@ -549,8 +558,107 @@ def format_dishware_summary() -> str:
 
 
 # =========================================================
-# ТТК / КАРТОЧКИ (tk_media_cards)
+# ТТК / КАРТОЧКИ + РЕНДЕР ИЗ ТЕКСТА В PNG (tk_media_cards)
 # =========================================================
+def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> bytes | None:
+    if not PIL_AVAILABLE:
+        return None
+    img = Image.new("RGB", (960, 560), color=(24, 24, 28))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([24, 24, 936, 536], outline=(212, 168, 83), width=3)
+
+    try:
+        font_title = ImageFont.truetype("arial.ttf", 40)
+        font_body = ImageFont.truetype("arial.ttf", 24)
+        font_small = ImageFont.truetype("arial.ttf", 19)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_body = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    header = f"ТЕХНОЛОГИЧЕСКАЯ КАРТА • {category.upper()}" if category else "ТЕХНОЛОГИЧЕСКАЯ КАРТА • ТТК"
+    draw.text((56, 54), header, fill=(212, 168, 83), font=font_small)
+
+    y = 100
+    for line in textwrap.wrap(title, width=32)[:2]:
+        draw.text((56, y), line, fill=(255, 255, 255), font=font_title)
+        y += 48
+
+    draw.line([(56, y + 10), (904, y + 10)], fill=(70, 70, 80), width=2)
+    y += 28
+
+    raw_lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
+    wrapped_lines: list[str] = []
+    for raw_ln in raw_lines:
+        wrapped_lines.extend(textwrap.wrap(raw_ln, width=62) or [""])
+
+    for ln in wrapped_lines[:11]:
+        draw.text((56, y), ln, fill=(225, 225, 232), font=font_body)
+        y += 32
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) -> tuple[bool, dict | str]:
+    lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+    if not lines:
+        return False, "Текст пуст — напиши название и описание/состав ТТК."
+
+    if len(lines) == 1:
+        single = lines[0]
+        split_match = re.split(r"\s+[—–-]\s+|:\s+", single, maxsplit=1)
+        if len(split_match) == 2 and split_match[0].strip():
+            title = split_match[0].strip()
+            body = split_match[1].strip()
+        else:
+            title = single
+            body = ""
+    else:
+        title = lines[0]
+        body = "\n".join(lines[1:])
+
+    card_id = f"media_{uuid.uuid4().hex[:10]}"
+    local_path = os.path.join(MEDIA_DIR, f"{card_id}.png")
+    png_bytes = render_ttk_png_bytes(title, body, category=category)
+    if png_bytes:
+        try:
+            with open(local_path, "wb") as out:
+                out.write(png_bytes)
+        except Exception as e:
+            print(f"[WARN] write rendered PNG failed: {e}", flush=True)
+            local_path = None
+    else:
+        local_path = None
+
+    card = {
+        "id": card_id,
+        "title": title,
+        "category": category,
+        "photo_file_id": None,
+        "photo_path": local_path,
+        "created_at": now_str(),
+    }
+
+    with DATA_LOCK:
+        cards = DB.setdefault("media_cards", [])
+        existing = next((c for c in cards if str(c.get("title") or "") == title), None)
+        if existing:
+            existing["photo_path"] = local_path
+            existing["photo_file_id"] = None
+            existing["created_at"] = card["created_at"]
+            if category:
+                existing["category"] = category
+            card = existing
+        else:
+            cards.append(card)
+        persist_media_card(card)
+
+    log_activity(uid, username, "TTK_CREATE_TEXT", f"{title} [{category or 'без категории'}]")
+    return True, card
+
+
 def persist_media_card(card: dict) -> None:
     sync_local_from_memory()
     sb_upsert(
@@ -726,6 +834,14 @@ def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
     file_id = card.get("photo_file_id")
     photo_path = card.get("photo_path")
 
+    if photo_path and os.path.isfile(photo_path):
+        try:
+            with open(photo_path, "rb") as f:
+                bot.send_document(chat_id, f, caption=caption, reply_markup=reply_markup)
+            return
+        except Exception as e:
+            print(f"[WARN] send media from disk failed: {e}", flush=True)
+
     if file_id:
         try:
             bot.send_document(chat_id, file_id, caption=caption, reply_markup=reply_markup)
@@ -736,14 +852,6 @@ def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
                 return
             except Exception as e:
                 print(f"[WARN] send media by file_id failed: {e}", flush=True)
-
-    if photo_path and os.path.isfile(photo_path):
-        try:
-            with open(photo_path, "rb") as f:
-                bot.send_document(chat_id, f, caption=caption, reply_markup=reply_markup)
-            return
-        except Exception as e:
-            print(f"[WARN] send media from disk failed: {e}", flush=True)
 
     safe_send_text(chat_id, caption, reply_markup=reply_markup)
 
@@ -1063,6 +1171,49 @@ def handle_text(msg: types.Message):
         )
         return
 
+    if st.get("mode") == "add_ttk_choose_cat":
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
+            return
+        chosen_cat = "" if low == "без категории" else low
+        if chosen_cat and chosen_cat not in TTK_CATEGORIES:
+            safe_send_text(msg.chat.id, "Выбери категорию на клавиатуре ниже:", reply_markup=ttk_category_keyboard())
+            return
+        USER_STATES[uid] = {"mode": "add_ttk_wait_text", "category": chosen_cat}
+        safe_send_text(
+            msg.chat.id,
+            f"Категория: <b>{esc(chosen_cat or 'без категории')}</b>.\n\n"
+            "Напиши ТТК текстом:\n"
+            "• 1-я строка — <b>название</b> (например, <code>Негрони</code>)\n"
+            "• Со 2-й строки — <b>состав, граммовки и подача</b>\n\n"
+            "Бот сам сделает из текста PNG-карточку и сохранит её.",
+            reply_markup=back_only_keyboard(),
+        )
+        return
+
+    if st.get("mode") == "add_ttk_wait_text":
+        if text == BTN_BACK:
+            USER_STATES[uid] = {"mode": "add_ttk_choose_cat"}
+            safe_send_text(msg.chat.id, "Выбери категорию для новой ТТК:", reply_markup=ttk_category_keyboard())
+            return
+        cat = str(st.get("category") or "")
+        USER_STATES.pop(uid, None)
+        ok, res = create_ttk_from_text(text, cat, uid, username)
+        if not ok:
+            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=recipes_menu_keyboard(uid))
+            return
+        card = res
+        if not card.get("photo_path"):
+            safe_send_text(
+                msg.chat.id,
+                f"⚠️ Карточка <b>{esc(card.get('title'))}</b> сохранена, но модуль Pillow не установлен — PNG не сгенерирован.",
+                reply_markup=recipes_menu_keyboard(uid),
+            )
+            return
+        safe_send_media_card(msg.chat.id, card, reply_markup=recipes_menu_keyboard(uid))
+        return
+
     if st.get("mode") == "ttk_select":
         page = int(st.get("page") or 0)
         if text == BTN_BACK:
@@ -1079,7 +1230,6 @@ def handle_text(msg: types.Message):
         with DATA_LOCK:
             cards = list(DB.get("media_cards", []))
 
-        # Массовое удаление по номерам через запятую / диапазонам (например: "1, 3, 5" или "1-3")
         if "," in text or "-" in text:
             selected_nums = parse_number_selection(text, len(cards))
             if not selected_nums:
@@ -1099,7 +1249,6 @@ def handle_text(msg: types.Message):
             show_ttk_manage_page(msg, page)
             return
 
-        # Выбор одного ТТК по номеру
         if text.isdigit():
             idx = int(text) - 1
             if 0 <= idx < len(cards):
@@ -1108,7 +1257,6 @@ def handle_text(msg: types.Message):
             safe_send_text(msg.chat.id, f"⚠️ ТТК с номером {text} нет (всего {len(cards)}).")
             return
 
-        # Выбор одного ТТК по точному названию
         target = next((c for c in cards if norm_text(c.get("title")) == low), None)
         if target:
             open_ttk_card_actions(msg, target)
@@ -1265,6 +1413,11 @@ def handle_text(msg: types.Message):
         safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
         return
 
+    if text == BTN_ADD_TTK_TEXT:
+        USER_STATES[uid] = {"mode": "add_ttk_choose_cat"}
+        safe_send_text(msg.chat.id, "Выбери категорию для новой ТТК:", reply_markup=ttk_category_keyboard())
+        return
+
     if text == BTN_MANAGE_TTK:
         show_ttk_manage_page(msg, 0)
         return
@@ -1370,7 +1523,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.9] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
+    print(f"[NEW BUILD v10.10] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
