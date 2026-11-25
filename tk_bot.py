@@ -159,7 +159,6 @@ def search_clean_text(value: str | None) -> str:
 
 
 def clean_uploaded_title(raw_title: str | None) -> str:
-    """Оставляет только название коктейля и обычные скобки (), убирая служебные символы и хвосты."""
     s = (raw_title or "").strip()
     if not s:
         return ""
@@ -1074,7 +1073,9 @@ def persist_media_card(card: dict) -> None:
             for k, v in full_row.items()
             if k not in ("category", "storage_path")
         }
-        sb_upsert("tk_media_cards", fallback_row, "id")
+        res2 = sb_upsert("tk_media_cards", fallback_row, "id")
+        if res2 is None:
+            print(f"[WARN] persist_media_card failed for {card.get('id')}", flush=True)
 
 
 def clean_existing_media_titles(uid: int, username: str) -> list[tuple[str, str]]:
@@ -1838,9 +1839,11 @@ def handle_media_upload(msg: types.Message):
             reply_markup=bulk_done_keyboard(),
         )
     else:
+        cat_text = active_cat or "без категории"
         safe_send_text(
             msg.chat.id,
-            f"✅ Сохранено: <b>{esc(title)}</b>",
+            f"✅ Сохранено в «<b>{esc(cat_text)}</b>»: <b>{esc(title)}</b>\n"
+            f"<i>Чтобы выбрать вкладку при загрузке, используй «📥 Массовая загрузка» или «🗂 Категория» в «✏️ Ред. / Удалить ТТК».</i>",
             reply_markup=main_menu_keyboard(uid),
         )
 
@@ -2327,7 +2330,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.24] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.25] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
