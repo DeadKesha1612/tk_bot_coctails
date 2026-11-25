@@ -25,6 +25,7 @@ SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 DONATIONALERTS_URL = (
     os.getenv("DONATIONALERTS_URL") or "https://www.donationalerts.com/r/your_link"
 ).strip()
+MAX_BULK_FILES = int((os.getenv("MAX_BULK_FILES") or "30").strip())
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
@@ -160,6 +161,36 @@ def safe_send_text(chat_id: int, text: str, reply_markup=None):
     except Exception as e:
         print(f"[WARN] send_message failed ({chat_id}): {e}", flush=True)
         return None
+
+
+def parse_number_selection(raw: str, max_index: int) -> list[int]:
+    """Разбирает строку вроде '1, 3, 5' или '1-3, 7' в список индексов (1..max_index)."""
+    cleaned = (raw or "").strip()
+    if not re.fullmatch(r"[\d\s,\-]+", cleaned):
+        return []
+    result: list[int] = []
+    seen: set[int] = set()
+    for part in cleaned.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            bounds = token.split("-", 1)
+            if bounds[0].strip().isdigit() and bounds[1].strip().isdigit():
+                a = int(bounds[0].strip())
+                b = int(bounds[1].strip())
+                if a > b:
+                    a, b = b, a
+                for n in range(a, b + 1):
+                    if 1 <= n <= max_index and n not in seen:
+                        seen.add(n)
+                        result.append(n)
+        elif token.isdigit():
+            n = int(token)
+            if 1 <= n <= max_index and n not in seen:
+                seen.add(n)
+                result.append(n)
+    return result
 
 
 # =========================================================
@@ -556,6 +587,15 @@ def delete_media_card_by_id(card_id: str, uid: int, username: str) -> dict | Non
     return removed
 
 
+def delete_media_cards_bulk(card_ids: list[str], uid: int, username: str) -> list[dict]:
+    removed_list: list[dict] = []
+    for cid in card_ids:
+        rem = delete_media_card_by_id(cid, uid, username)
+        if rem:
+            removed_list.append(rem)
+    return removed_list
+
+
 def update_media_card_title(card_id: str, new_title: str, uid: int, username: str) -> dict | None:
     with DATA_LOCK:
         cards = DB.get("media_cards", [])
@@ -728,6 +768,7 @@ def show_ttk_manage_page(msg: types.Message, page: int = 0) -> None:
     with DATA_LOCK:
         cards = list(DB.get("media_cards", []))
     if not cards:
+        USER_STATES.pop(uid, None)
         safe_send_text(msg.chat.id, "ТТК (карточек) пока нет.", reply_markup=recipes_menu_keyboard(uid))
         return
 
@@ -752,7 +793,8 @@ def show_ttk_manage_page(msg: types.Message, page: int = 0) -> None:
         msg.chat.id,
         f"✏️ <b>Управление ТТК</b> (стр. {page + 1}/{total_pages}, всего {len(cards)}):\n\n"
         + "\n".join(lines)
-        + "\n\nНапиши <b>номер</b> ТТК (или точное название) для редактирования или удаления.",
+        + "\n\n• Напиши <b>один номер</b> (например, <code>1</code>) или точное название для редактирования/удаления.\n"
+        "• Напиши <b>несколько номеров через запятую</b> (например, <code>1, 3, 5</code> или <code>1-3</code>), чтобы удалить их сразу.",
         reply_markup=ttk_list_keyboard(page, total_pages),
     )
 
@@ -883,15 +925,16 @@ def start_bulk_mode(msg: types.Message, active_category: str = "") -> None:
     USER_STATES[uid] = {
         "mode": "media_bulk_add",
         "count": 0,
+        "max_files": MAX_BULK_FILES,
         "titles": [],
         "category": active_category,
     }
     safe_send_text(
         msg.chat.id,
-        "📥 <b>Режим массовой загрузки файлов/PNG включён.</b>\n\n"
-        "Отправляй файлы подряд (например, 10+ PNG). Название запишется в базу "
-        "<b>один в один</b> как имя файла без расширения (например, файл <code>коктейль Алексей.png</code> → "
-        "название <code>коктейль Алексей</code>).\n\n"
+        f"📥 <b>Режим массовой загрузки файлов/PNG включён.</b>\n\n"
+        f"За один сеанс можно загрузить до <b>{MAX_BULK_FILES}</b> файлов (сейчас загружено: <b>0/{MAX_BULK_FILES}</b>).\n"
+        "Отправляй файлы подряд — название запишется в базу <b>один в один</b> как имя файла без расширения "
+        "(например, <code>коктейль Алексей.png</code> → <code>коктейль Алексей</code>).\n\n"
         "Когда закончишь — нажми <b>✅ Готово</b>.",
         reply_markup=bulk_done_keyboard(),
     )
@@ -955,6 +998,17 @@ def handle_media_upload(msg: types.Message):
         )
         return
 
+    if st.get("mode") == "media_bulk_add":
+        max_files = int(st.get("max_files") or MAX_BULK_FILES)
+        current_count = int(st.get("count") or 0)
+        if current_count >= max_files:
+            safe_send_text(
+                msg.chat.id,
+                f"⚠️ Достигнут лимит загрузки за один сеанс (<b>{max_files}/{max_files}</b>). Нажми <b>✅ Готово</b>.",
+                reply_markup=bulk_done_keyboard(),
+            )
+            return
+
     active_cat = str(st.get("category") or "")
     ok, res = save_incoming_media_card(msg, active_category=active_cat)
     if not ok:
@@ -967,10 +1021,12 @@ def handle_media_upload(msg: types.Message):
 
     if st.get("mode") == "media_bulk_add":
         st["count"] = int(st.get("count") or 0) + 1
+        max_files = int(st.get("max_files") or MAX_BULK_FILES)
         st.setdefault("titles", []).append(title)
+        remaining = max(0, max_files - st["count"])
         safe_send_text(
             msg.chat.id,
-            f"➕ Сохранено (#{st['count']}): <b>{esc(title)}</b>",
+            f"➕ Сохранено (<b>{st['count']}/{max_files}</b>, осталось <b>{remaining}</b>): <b>{esc(title)}</b>",
             reply_markup=bulk_done_keyboard(),
         )
     else:
@@ -998,9 +1054,11 @@ def handle_text(msg: types.Message):
             USER_STATES.pop(uid, None)
             safe_send_text(msg.chat.id, "❌ Загрузка отменена.", reply_markup=main_menu_keyboard(uid))
             return
+        max_files = int(st.get("max_files") or MAX_BULK_FILES)
+        cur = int(st.get("count") or 0)
         safe_send_text(
             msg.chat.id,
-            "Сейчас активен режим массовой загрузки. Кидай файлы/PNG или нажми <b>✅ Готово</b>.",
+            f"Сейчас активен режим массовой загрузки (<b>{cur}/{max_files}</b>). Кидай файлы/PNG или нажми <b>✅ Готово</b>.",
             reply_markup=bulk_done_keyboard(),
         )
         return
@@ -1018,17 +1076,48 @@ def handle_text(msg: types.Message):
             show_ttk_manage_page(msg, page - 1)
             return
 
-        page_map = st.get("page_map") or {}
-        card_id = page_map.get(text)
         with DATA_LOCK:
             cards = list(DB.get("media_cards", []))
-        target = next((c for c in cards if str(c.get("id")) == str(card_id)), None) if card_id else None
-        if not target:
-            target = next((c for c in cards if norm_text(c.get("title")) == low), None)
+
+        # Массовое удаление по номерам через запятую / диапазонам (например: "1, 3, 5" или "1-3")
+        if "," in text or "-" in text:
+            selected_nums = parse_number_selection(text, len(cards))
+            if not selected_nums:
+                safe_send_text(
+                    msg.chat.id,
+                    f"⚠️ Некорректные номера. Укажи числа от 1 до {len(cards)} через запятую (например, <code>1, 2, 4</code>).",
+                    reply_markup=ttk_list_keyboard(page, max(1, (len(cards) + 9) // 10)),
+                )
+                return
+            target_ids = [str(cards[n - 1].get("id")) for n in selected_nums]
+            removed_items = delete_media_cards_bulk(target_ids, uid, username)
+            removed_names = "\n".join(f"• {esc(r.get('title') or '')}" for r in removed_items)
+            safe_send_text(
+                msg.chat.id,
+                f"🗑 Удалено ТТК: <b>{len(removed_items)}</b>\n\n{removed_names}",
+            )
+            show_ttk_manage_page(msg, page)
+            return
+
+        # Выбор одного ТТК по номеру
+        if text.isdigit():
+            idx = int(text) - 1
+            if 0 <= idx < len(cards):
+                open_ttk_card_actions(msg, cards[idx])
+                return
+            safe_send_text(msg.chat.id, f"⚠️ ТТК с номером {text} нет (всего {len(cards)}).")
+            return
+
+        # Выбор одного ТТК по точному названию
+        target = next((c for c in cards if norm_text(c.get("title")) == low), None)
         if target:
             open_ttk_card_actions(msg, target)
             return
-        safe_send_text(msg.chat.id, "Введи номер из списка или точное название ТТК, либо нажми <b>⬅️ Назад</b>.")
+
+        safe_send_text(
+            msg.chat.id,
+            "Введи номер ТТК, несколько номеров через запятую (например, <code>1, 2, 3</code>) или точное название.",
+        )
         return
 
     if st.get("mode") == "ttk_card_actions":
@@ -1281,7 +1370,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.8] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
+    print(f"[NEW BUILD v10.9] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
