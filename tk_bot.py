@@ -45,6 +45,7 @@ SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 DATA_DIR = os.getenv("DATA_DIR", "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "user_media")
 FONT_CACHE_PATH = os.path.join(DATA_DIR, "DejaVuSans.ttf")
+FONT_BOLD_CACHE_PATH = os.path.join(DATA_DIR, "DejaVuSans-Bold.ttf")
 LOCAL_DB_FILE = os.path.join(DATA_DIR, "tk_bot_state.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -559,83 +560,228 @@ def format_dishware_summary() -> str:
 
 
 # =========================================================
-# ТТК / КАРТОЧКИ + ШРИФТ И РЕНДЕР В PNG (tk_media_cards)
+# ТТК / КАРТОЧКИ + ОФОРМЛЕНИЕ ТТК В PNG (tk_media_cards)
 # =========================================================
-def ensure_cyrillic_font_path() -> str | None:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base_dir, "DejaVuSans.ttf"),
-        os.path.join(base_dir, "font.ttf"),
-        FONT_CACHE_PATH,
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path) and os.path.getsize(path) > 10000:
-            return path
-
-    font_urls = [
-        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
-        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
-    ]
-    for url in font_urls:
+def _download_font_if_needed(target_path: str, urls: list[str]) -> str | None:
+    if os.path.isfile(target_path) and os.path.getsize(target_path) > 10000:
+        return target_path
+    for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read()
             if len(data) > 50000:
-                with open(FONT_CACHE_PATH, "wb") as f:
+                with open(target_path, "wb") as f:
                     f.write(data)
-                print(f"[FONT] Cached Cyrillic font at {FONT_CACHE_PATH}", flush=True)
-                return FONT_CACHE_PATH
+                return target_path
         except Exception as e:
             print(f"[WARN] Font download failed ({url}): {e}", flush=True)
     return None
 
 
-def load_ttk_fonts():
-    font_path = ensure_cyrillic_font_path()
-    if font_path:
+def ensure_cyrillic_fonts() -> tuple[str | None, str | None]:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    regular_candidates = [
+        os.path.join(base_dir, "DejaVuSans.ttf"),
+        os.path.join(base_dir, "font.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    bold_candidates = [
+        os.path.join(base_dir, "DejaVuSans-Bold.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+    ]
+
+    reg_path = next((p for p in regular_candidates if p and os.path.isfile(p) and os.path.getsize(p) > 10000), None)
+    if not reg_path:
+        reg_path = _download_font_if_needed(
+            FONT_CACHE_PATH,
+            [
+                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+                "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
+            ],
+        )
+
+    bold_path = next((p for p in bold_candidates if p and os.path.isfile(p) and os.path.getsize(p) > 10000), None)
+    if not bold_path:
+        bold_path = _download_font_if_needed(
+            FONT_BOLD_CACHE_PATH,
+            [
+                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+                "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans-Bold.ttf",
+            ],
+        ) or reg_path
+
+    return reg_path, bold_path
+
+
+def load_ttk_card_fonts():
+    reg_path, bold_path = ensure_cyrillic_fonts()
+    if reg_path and bold_path:
         try:
-            return (
-                ImageFont.truetype(font_path, 38),
-                ImageFont.truetype(font_path, 23),
-                ImageFont.truetype(font_path, 18),
-            )
+            return {
+                "eyebrow": ImageFont.truetype(bold_path, 16),
+                "title": ImageFont.truetype(bold_path, 34),
+                "sec_head": ImageFont.truetype(bold_path, 19),
+                "col_head": ImageFont.truetype(bold_path, 15),
+                "item": ImageFont.truetype(reg_path, 22),
+                "item_bold": ImageFont.truetype(bold_path, 22),
+                "prep": ImageFont.truetype(reg_path, 21),
+            }
         except Exception as e:
-            print(f"[WARN] ImageFont.truetype failed ({font_path}): {e}", flush=True)
-    return ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default()
+            print(f"[WARN] ImageFont.truetype failed: {e}", flush=True)
+    fallback = ImageFont.load_default()
+    return {
+        "eyebrow": fallback,
+        "title": fallback,
+        "sec_head": fallback,
+        "col_head": fallback,
+        "item": fallback,
+        "item_bold": fallback,
+        "prep": fallback,
+    }
+
+
+def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Разбирает текст ТТК на строки таблицы СОСТАВ (позиция, количество) и строки ПРИГОТОВЛЕНИЕ."""
+    ingredients: list[tuple[str, str]] = []
+    prep_lines: list[str] = []
+    in_prep = False
+
+    raw_lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
+    for ln in raw_lines:
+        low = norm_text(ln)
+        if re.match(r"^(приготовление|способ приготовления|метод)[:：]?$", low):
+            in_prep = True
+            continue
+        if re.match(r"^(состав|ингредиенты)[:：]?$", low):
+            in_prep = False
+            continue
+
+        if in_prep:
+            prep_lines.append(ln)
+            continue
+
+        # Строка формата "Выход: 120 мл", "Джин - 30 мл", "Водка 40" или "Водка\t40"
+        m_sep = re.match(r"^(.+?)\s*(?:\t|\s{2,}|[:—–-])\s*(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)?)$", ln, flags=re.I)
+        if not m_sep:
+            m_sep = re.match(r"^(.+?)\s+(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап))$", ln, flags=re.I)
+
+        if m_sep:
+            ing_name = m_sep.group(1).strip(" •-–—")
+            ing_qty = m_sep.group(2).strip()
+            ingredients.append((ing_name, ing_qty))
+        elif len(ln) <= 75 and not re.search(r"[.!?]{2,}", ln) and not ln.endswith("."):
+            ingredients.append((ln.strip(" •-–—"), ""))
+        else:
+            in_prep = True
+            prep_lines.append(ln)
+
+    if not ingredients and not prep_lines:
+        prep_lines.append(title)
+
+    return ingredients, prep_lines
+
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> int:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return int(bbox[2] - bbox[0])
 
 
 def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> bytes | None:
     if not PIL_AVAILABLE:
         return None
-    img = Image.new("RGB", (960, 560), color=(24, 24, 28))
+
+    fonts = load_ttk_card_fonts()
+    ingredients, prep_lines = _parse_ttk_sections(title, body_text)
+
+    canvas_w = 1280
+    outer_pad = 36
+    card_x0 = outer_pad
+    card_y0 = outer_pad
+    card_x1 = canvas_w - outer_pad
+    card_w = card_x1 - card_x0
+
+    inner_x0 = card_x0 + 68
+    inner_x1 = card_x1 - 68
+    inner_w = inner_x1 - inner_x0
+
+    # Предварительно заворачиваем строки
+    title_lines = textwrap.wrap(title.upper(), width=38) or [title.upper()]
+    wrapped_ing: list[tuple[str, str]] = []
+    for name, qty in ingredients:
+        w_lines = textwrap.wrap(name, width=54) or [name]
+        for idx, w_line in enumerate(w_lines):
+            wrapped_ing.append((w_line, qty if idx == 0 else ""))
+
+    wrapped_prep: list[str] = []
+    for p_line in prep_lines:
+        wrapped_prep.extend(textwrap.wrap(p_line, width=78) or [p_line])
+
+    # Рассчитываем высоту карточки
+    est_h = 110 + len(title_lines) * 44 + 40
+    if wrapped_ing:
+        est_h += 95 + len(wrapped_ing) * 46 + 24
+    if wrapped_prep:
+        est_h += 75 + len(wrapped_prep) * 34 + 30
+    est_h += 55
+
+    canvas_h = max(620, outer_pad * 2 + est_h)
+    card_y1 = canvas_h - outer_pad
+
+    img = Image.new("RGB", (canvas_w, canvas_h), color=(28, 30, 36))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([24, 24, 936, 536], outline=(212, 168, 83), width=3)
 
-    font_title, font_body, font_small = load_ttk_fonts()
+    # Светлая карточка со скруглёнными углами как на референсе
+    draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=24, fill=(246, 247, 249))
 
-    header = f"ТЕХНОЛОГИЧЕСКАЯ КАРТА • {category.upper()}" if category else "ТЕХНОЛОГИЧЕСКАЯ КАРТА • ТТК"
-    draw.text((56, 54), header, fill=(212, 168, 83), font=font_small)
+    y = card_y0 + 54
+    draw.text((inner_x0, y), "ТЕХНОЛОГИЧЕСКАЯ КАРТА", fill=(115, 122, 134), font=fonts["eyebrow"])
+    y += 32
 
-    y = 100
-    for line in textwrap.wrap(title, width=30)[:2]:
-        draw.text((56, y), line, fill=(255, 255, 255), font=font_title)
-        y += 46
+    for t_line in title_lines:
+        draw.text((inner_x0, y), t_line, fill=(17, 20, 26), font=fonts["title"])
+        y += 43
 
-    draw.line([(56, y + 10), (904, y + 10)], fill=(70, 70, 80), width=2)
-    y += 28
+    y += 14
+    draw.line([(inner_x0, y), (inner_x1, y)], fill=(214, 218, 224), width=2)
+    y += 26
 
-    raw_lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
-    wrapped_lines: list[str] = []
-    for raw_ln in raw_lines:
-        wrapped_lines.extend(textwrap.wrap(raw_ln, width=58) or [""])
-
-    for ln in wrapped_lines[:11]:
-        draw.text((56, y), ln, fill=(225, 225, 232), font=font_body)
+    if wrapped_ing:
+        draw.text((inner_x0, y), "СОСТАВ", fill=(17, 20, 26), font=fonts["sec_head"])
         y += 32
+
+        draw.text((inner_x0, y), "ИНГРЕДИЕНТ / ПОЗИЦИЯ", fill=(122, 128, 138), font=fonts["col_head"])
+        qty_hdr = "КОЛИЧЕСТВО"
+        draw.text((inner_x1 - _text_width(draw, qty_hdr, fonts["col_head"]), y), qty_hdr, fill=(122, 128, 138), font=fonts["col_head"])
+        y += 28
+
+        for idx, (ing_name, ing_qty) in enumerate(wrapped_ing):
+            is_vykhod = norm_text(ing_name).startswith("выход")
+            row_font = fonts["item_bold"] if is_vykhod else fonts["item"]
+            qty_font = fonts["item_bold"] if (is_vykhod or ing_qty) else fonts["item"]
+
+            draw.text((inner_x0, y), ing_name, fill=(24, 28, 34), font=row_font)
+            if ing_qty:
+                qw = _text_width(draw, ing_qty, qty_font)
+                draw.text((inner_x1 - qw, y), ing_qty, fill=(24, 28, 34), font=qty_font)
+
+            y += 36
+            if idx < len(wrapped_ing) - 1:
+                draw.line([(inner_x0, y), (inner_x1, y)], fill=(230, 233, 238), width=1)
+            y += 10
+
+        y += 14
+
+    if wrapped_prep:
+        draw.text((inner_x0, y), "ПРИГОТОВЛЕНИЕ", fill=(17, 20, 26), font=fonts["sec_head"])
+        y += 34
+        for p_line in wrapped_prep:
+            draw.text((inner_x0, y), p_line, fill=(36, 40, 48), font=fonts["prep"])
+            y += 33
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -1226,9 +1372,9 @@ def handle_text(msg: types.Message):
             msg.chat.id,
             f"Категория: <b>{esc(chosen_cat or 'без категории')}</b>.\n\n"
             "Напиши ТТК текстом:\n"
-            "• 1-я строка — <b>название</b> (например, <code>Негрони</code>)\n"
-            "• Со 2-й строки — <b>состав, граммовки и подача</b>\n\n"
-            "Бот сам сделает из текста PNG-карточку и сохранит её.",
+            "• 1-я строка — <b>название</b>\n"
+            "• Строки с количеством (например, <code>Выход: 120 мл</code>, <code>Джин 30 мл</code>) — уйдут в таблицу <b>СОСТАВ</b>\n"
+            "• Остальные строки — в блок <b>ПРИГОТОВЛЕНИЕ</b>",
             reply_markup=back_only_keyboard(),
         )
         return
@@ -1564,7 +1710,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.11] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.12] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
