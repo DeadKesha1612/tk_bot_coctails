@@ -135,6 +135,12 @@ def norm_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+def search_clean_text(value: str | None) -> str:
+    """Очищает название/запрос от подчёркиваний и спецсимволов для поиска по словам."""
+    cleaned = re.sub(r"[_\-—–/\\.,:;!?()\"'«»№*+#]+", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def exact_title_from_message(msg: types.Message) -> str | None:
     if msg.content_type == "document" and msg.document and msg.document.file_name:
         stem, _ = os.path.splitext(msg.document.file_name)
@@ -1075,15 +1081,49 @@ def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
 
 
 def find_media_matches(query: str) -> list[dict]:
-    q = norm_text(query)
-    if not q:
+    q_raw = norm_text(query)
+    q_clean = search_clean_text(query)
+    if not q_raw and not q_clean:
         return []
+
     with DATA_LOCK:
         cards = list(DB.get("media_cards", []))
-    exact = [c for c in cards if norm_text(c.get("title")) == q]
+
+    exact = [
+        c for c in cards
+        if norm_text(c.get("title")) == q_raw
+        or (q_clean and search_clean_text(c.get("title")) == q_clean)
+    ]
     if exact:
         return exact
-    return [c for c in cards if q in norm_text(c.get("title"))]
+
+    keywords = [w for w in q_clean.split() if len(w) >= 1]
+    if not keywords:
+        return [c for c in cards if q_raw in norm_text(c.get("title"))]
+
+    all_words_matches: list[tuple[int, dict]] = []
+    partial_matches: list[tuple[int, dict]] = []
+
+    for c in cards:
+        title_clean = search_clean_text(c.get("title"))
+        title_words = title_clean.split()
+        matched_count = 0
+        for kw in keywords:
+            if kw in title_words or any(kw in tw for tw in title_words) or kw in title_clean:
+                matched_count += 1
+
+        if matched_count == len(keywords):
+            score = matched_count * 10 + (1 if q_clean in title_clean else 0)
+            all_words_matches.append((score, c))
+        elif matched_count > 0:
+            partial_matches.append((matched_count, c))
+
+    if all_words_matches:
+        all_words_matches.sort(key=lambda pair: pair[0], reverse=True)
+        return [c for _, c in all_words_matches]
+
+    partial_matches.sort(key=lambda pair: pair[0], reverse=True)
+    return [c for _, c in partial_matches]
 
 
 def show_ttk_buttons_page(
@@ -1761,7 +1801,7 @@ def handle_text(msg: types.Message):
         send_support_link(msg)
         return
 
-    # Текстовый поиск по сохранённым карточкам
+    # Текстовый поиск по ключевым словам
     print(f"[TEXT_SEARCH] uid={uid} query={text!r}", flush=True)
     log_activity(uid, username, "SEARCH", text[:120])
     matches = find_media_matches(text)
@@ -1798,7 +1838,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.14] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.15] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
