@@ -816,13 +816,12 @@ def load_ttk_card_fonts():
     if reg_path and bold_path:
         try:
             return {
-                "eyebrow": ImageFont.truetype(bold_path, 16),
-                "title": ImageFont.truetype(bold_path, 34),
-                "sec_head": ImageFont.truetype(bold_path, 19),
-                "col_head": ImageFont.truetype(bold_path, 15),
-                "item": ImageFont.truetype(reg_path, 22),
-                "item_bold": ImageFont.truetype(bold_path, 22),
-                "prep": ImageFont.truetype(reg_path, 21),
+                "eyebrow": ImageFont.truetype(bold_path, 17),
+                "title": ImageFont.truetype(bold_path, 38),
+                "sec_head": ImageFont.truetype(bold_path, 21),
+                "item": ImageFont.truetype(reg_path, 24),
+                "item_bold": ImageFont.truetype(bold_path, 24),
+                "prep": ImageFont.truetype(reg_path, 23),
             }
         except Exception as e:
             print(f"[WARN] ImageFont.truetype failed: {e}", flush=True)
@@ -831,59 +830,98 @@ def load_ttk_card_fonts():
         "eyebrow": fallback,
         "title": fallback,
         "sec_head": fallback,
-        "col_head": fallback,
         "item": fallback,
         "item_bold": fallback,
         "prep": fallback,
     }
 
 
+def _split_ingredient_line_or_clause(raw_item: str) -> tuple[str, str]:
+    s = re.sub(r"\s+", " ", (raw_item or "").strip(" •-–—;"))
+    if not s:
+        return "", ""
+
+    qty_pattern = r"(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап|барн\.?\s*л\.?|ч\.?\s*л\.?|ст\.?\s*л\.?))"
+    matches = list(re.finditer(qty_pattern, s, flags=re.I))
+    if matches:
+        last_m = matches[-1]
+        qty_str = re.sub(r"\s+", "", last_m.group(1).strip())
+        before = s[: last_m.start()].strip(" ,:;—–-")
+        after = s[last_m.end() :].strip(" ,:;—–-")
+        name_part = " ".join(part for part in (before, after) if part).strip(" ,:;—–-")
+        if name_part:
+            return name_part, qty_str
+
+    m_sep = re.match(r"^(.+?)\s*(?:\t|\s{2,}|[:—–-])\s*(\d+(?:[.,]\d+)?\s*\S*)$", s)
+    if m_sep:
+        return m_sep.group(1).strip(" •-–—"), m_sep.group(2).strip()
+
+    return s, ""
+
+
+def _parse_ingredient_chunk(ing_chunk: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for line in (ing_chunk or "").splitlines():
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+        if re.match(r"^(состав|ингредиенты)[:：]?$", norm_text(clean_line)):
+            continue
+        # Поддерживаем перечисление ингредиентов через запятую или точку с запятой в одной строке
+        parts = [p.strip() for p in re.split(r"[,;]+", clean_line) if p.strip()]
+        for part in parts:
+            name, qty = _split_ingredient_line_or_clause(part)
+            if name or qty:
+                items.append((name or part, qty))
+    return items
+
+
 def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    raw_text = (body_text or "").strip()
+    if not raw_text:
+        return [], [title]
+
+    # Проверяем явные заголовки "Состав:" и "Приготовление:"
+    m_prep_marker = re.search(
+        r"(?im)^(?:приготовление|способ приготовления|метод|описание)\s*[:：—–-]?\s*(.*)$",
+        raw_text,
+    )
+    if m_prep_marker:
+        comp_part = raw_text[: m_prep_marker.start()].strip()
+        first_prep_line = m_prep_marker.group(1).strip()
+        rest_prep = raw_text[m_prep_marker.end() :].strip()
+        prep_combined = "\n".join(x for x in (first_prep_line, rest_prep) if x)
+        ingredients = _parse_ingredient_chunk(comp_part)
+        prep_lines = [ln.strip() for ln in prep_combined.splitlines() if ln.strip()]
+        if not prep_lines and title:
+            prep_lines = [title]
+        return ingredients, prep_lines
+
+    # Формат через пустую строку:
+    # параграф 1 — состав, параграф 2 (после пустой строки) — метод приготовления
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", raw_text) if p.strip()]
+    if len(paragraphs) >= 2:
+        comp_block = "\n".join(paragraphs[:-1])
+        prep_block = paragraphs[-1]
+        ingredients = _parse_ingredient_chunk(comp_block)
+        prep_lines = [ln.strip() for ln in prep_block.splitlines() if ln.strip()]
+        if ingredients:
+            return ingredients, prep_lines
+
+    # Однострочный или слитный блок без пустых строк:
+    # если есть запятые/количества — в состав, остальное — в приготовление
     ingredients: list[tuple[str, str]] = []
     prep_lines: list[str] = []
-    in_prep = False
-
-    raw_lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
-    for ln in raw_lines:
-        low = norm_text(ln)
-        if re.match(r"^(приготовление|способ приготовления|метод|описание)[:：]?$", low):
-            in_prep = True
+    for ln in raw_text.splitlines():
+        clean = ln.strip()
+        if not clean:
             continue
-        if re.match(r"^(состав|ингредиенты)[:：]?$", low):
-            in_prep = False
-            continue
-
-        m_prep_inline = re.match(
-            r"^(?:приготовление|способ приготовления|метод|описание)\s*[:：—–-]\s*(.+)$",
-            ln,
-            flags=re.I,
-        )
-        if m_prep_inline:
-            in_prep = True
-            prep_lines.append(m_prep_inline.group(1).strip())
-            continue
-
-        if in_prep:
-            prep_lines.append(ln)
-            continue
-
-        m_sep = re.match(
-            r"^(.+?)\s*(?:\t|\s{2,}|[:—–-])\s*(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)?)$",
-            ln,
-            flags=re.I,
-        )
-        if not m_sep:
-            m_sep = re.match(r"^(.+?)\s+(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап))$", ln, flags=re.I)
-
-        if m_sep:
-            ing_name = m_sep.group(1).strip(" •-–—")
-            ing_qty = m_sep.group(2).strip()
-            ingredients.append((ing_name, ing_qty))
-        elif len(ln) <= 75 and not re.search(r"[.!?]{2,}", ln) and not ln.endswith("."):
-            ingredients.append((ln.strip(" •-–—"), ""))
+        parsed_here = _parse_ingredient_chunk(clean)
+        has_qty_or_list = any(q for _, q in parsed_here) or ("," in clean and len(clean) <= 140)
+        if has_qty_or_list and not prep_lines:
+            ingredients.extend(parsed_here)
         else:
-            in_prep = True
-            prep_lines.append(ln)
+            prep_lines.append(clean)
 
     if not ingredients and not prep_lines:
         prep_lines.append(title)
@@ -903,29 +941,43 @@ def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
         clean_chunk = chunk.strip()
         if not clean_chunk:
             continue
+
         paras = [p.strip() for p in re.split(r"\n\s*\n+", clean_chunk) if p.strip()]
-        if len(paras) <= 1:
+        if len(paras) <= 3:
             blocks.append(clean_chunk)
             continue
 
-        current_lines: list[str] = []
-        for p in paras:
-            p_lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
-            first_line = p_lines[0] if p_lines else ""
-            is_new_item_header = (
-                len(p_lines) >= 2
-                and len(first_line) <= 65
+        # Когда в одном тексте подряд идут несколько позиций формата:
+        # [Название] -> [Состав] -> [Приготовление] -> [Следующее название] -> ...
+        i = 0
+        while i < len(paras):
+            title_p = paras[i]
+            first_line = title_p.splitlines()[0].strip() if title_p else ""
+            looks_like_title = (
+                len(title_p.splitlines()) == 1
+                and len(first_line) <= 60
                 and not re.match(r"^(?:приготовление|способ приготовления|метод|описание|состав|ингредиенты)\b", first_line, flags=re.I)
-                and not re.search(r"\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)\b", first_line, flags=re.I)
+                and not re.search(r"\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт)\b", first_line, flags=re.I)
             )
-            if current_lines and is_new_item_header:
-                blocks.append("\n".join(current_lines))
-                current_lines = list(p_lines)
-            else:
-                current_lines.extend(p_lines)
+            if looks_like_title and i + 2 < len(paras):
+                comp_p = paras[i + 1]
+                prep_p = paras[i + 2]
+                # Если через ещё один параграф идёт новый заголовок, группируем тройку
+                if i + 3 < len(paras):
+                    next_first = paras[i + 3].splitlines()[0].strip()
+                    next_is_title = (
+                        len(paras[i + 3].splitlines()) == 1
+                        and len(next_first) <= 60
+                        and not re.match(r"^(?:приготовление|способ приготовления|метод|описание|состав|ингредиенты)\b", next_first, flags=re.I)
+                        and not re.search(r"\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт)\b", next_first, flags=re.I)
+                    )
+                    if next_is_title:
+                        blocks.append(f"{title_p}\n\n{comp_p}\n\n{prep_p}")
+                        i += 3
+                        continue
 
-        if current_lines:
-            blocks.append("\n".join(current_lines))
+            blocks.append("\n\n".join(paras[i:]))
+            break
 
     return blocks
 
@@ -942,90 +994,109 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     fonts = load_ttk_card_fonts()
     ingredients, prep_lines = _parse_ttk_sections(title, body_text)
 
-    canvas_w = 1280
-    outer_pad = 36
-    card_x0 = outer_pad
-    card_y0 = outer_pad
-    card_x1 = canvas_w - outer_pad
+    canvas_w = 1200
+    pad_x = 44
+    pad_y = 40
+    inner_x0 = pad_x + 44
+    inner_x1 = canvas_w - pad_x - 44
+    inner_w = inner_x1 - inner_x0
 
-    inner_x0 = card_x0 + 68
-    inner_x1 = card_x1 - 68
+    title_lines = textwrap.wrap(title.upper(), width=34) or [title.upper()]
 
-    title_lines = textwrap.wrap(title.upper(), width=38) or [title.upper()]
     wrapped_ing: list[tuple[str, str]] = []
     for name, qty in ingredients:
-        w_lines = textwrap.wrap(name, width=54) or [name]
-        for idx, w_line in enumerate(w_lines):
+        max_name_w = int(inner_w * 0.72) if qty else inner_w
+        wrapped_name = []
+        cur = ""
+        for word in name.split():
+            trial = f"{cur} {word}".strip()
+            if _text_width(draw_tmp := ImageDraw.Draw(Image.new("RGB", (10, 10))), trial, fonts["item"]) <= max_name_w:
+                cur = trial
+            else:
+                if cur:
+                    wrapped_name.append(cur)
+                cur = word
+        if cur:
+            wrapped_name.append(cur)
+        for idx, w_line in enumerate(wrapped_name or [name]):
             wrapped_ing.append((w_line, qty if idx == 0 else ""))
 
     wrapped_prep: list[str] = []
     for p_line in prep_lines:
-        wrapped_prep.extend(textwrap.wrap(p_line, width=78) or [p_line])
+        cur = ""
+        for word in p_line.split():
+            trial = f"{cur} {word}".strip()
+            if _text_width(ImageDraw.Draw(Image.new("RGB", (10, 10))), trial, fonts["prep"]) <= inner_w:
+                cur = trial
+            else:
+                if cur:
+                    wrapped_prep.append(cur)
+                cur = word
+        if cur:
+            wrapped_prep.append(cur)
 
-    est_h = 110 + len(title_lines) * 44 + 40
-    if wrapped_ing:
-        est_h += 95 + len(wrapped_ing) * 46 + 24
-    if wrapped_prep:
-        est_h += 75 + len(wrapped_prep) * 34 + 30
-    est_h += 55
+    ing_box_h = 66 + len(wrapped_ing) * 44 + 18 if wrapped_ing else 0
+    prep_box_h = 66 + len(wrapped_prep) * 38 + 20 if wrapped_prep else 0
+    header_h = 66 + len(title_lines) * 46 + 24
+    total_h = pad_y * 2 + header_h + (ing_box_h + 22 if ing_box_h else 0) + prep_box_h + 24
 
-    canvas_h = max(620, outer_pad * 2 + est_h)
-    card_y1 = canvas_h - outer_pad
-
-    img = Image.new("RGB", (canvas_w, canvas_h), color=(28, 30, 36))
+    img = Image.new("RGB", (canvas_w, total_h), color=(24, 27, 34))
     draw = ImageDraw.Draw(img)
 
-    draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=24, fill=(246, 247, 249))
+    card_x0 = pad_x
+    card_y0 = pad_y
+    card_x1 = canvas_w - pad_x
+    card_y1 = total_h - pad_y
 
-    y = card_y0 + 54
-    draw.text((inner_x0, y), "ТЕХНОЛОГИЧЕСКАЯ КАРТА", fill=(115, 122, 134), font=fonts["eyebrow"])
+    draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=26, fill=(248, 249, 251))
+    # Акцентная верхняя полоса карточки
+    draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y0 + 10], radius=5, fill=(217, 119, 6))
+
+    y = card_y0 + 30
+    cat_badge = f"ТЕХНОЛОГИЧЕСКАЯ КАРТА  •  {category.upper()}" if category else "ТЕХНОЛОГИЧЕСКАЯ КАРТА"
+    draw.text((inner_x0, y), cat_badge, fill=(180, 95, 10), font=fonts["eyebrow"])
     y += 32
 
     for t_line in title_lines:
-        draw.text((inner_x0, y), t_line, fill=(17, 20, 26), font=fonts["title"])
-        y += 43
+        draw.text((inner_x0, y), t_line, fill=(17, 24, 39), font=fonts["title"])
+        y += 45
 
     y += 14
-    draw.line([(inner_x0, y), (inner_x1, y)], fill=(214, 218, 224), width=2)
-    y += 26
 
     if wrapped_ing:
-        draw.text((inner_x0, y), "СОСТАВ", fill=(17, 20, 26), font=fonts["sec_head"])
-        y += 32
-
-        draw.text((inner_x0, y), "ИНГРЕДИЕНТ / ПОЗИЦИЯ", fill=(122, 128, 138), font=fonts["col_head"])
-        qty_hdr = "КОЛИЧЕСТВО"
-        draw.text(
-            (inner_x1 - _text_width(draw, qty_hdr, fonts["col_head"]), y),
-            qty_hdr,
-            fill=(122, 128, 138),
-            font=fonts["col_head"],
-        )
-        y += 28
+        sec_top = y
+        sec_bot = y + ing_box_h
+        draw.rounded_rectangle([inner_x0 - 20, sec_top, inner_x1 + 20, sec_bot], radius=16, fill=(255, 255, 255), outline=(226, 232, 240), width=2)
+        sy = sec_top + 18
+        draw.text((inner_x0, sy), "СОСТАВ", fill=(17, 24, 39), font=fonts["sec_head"])
+        sy += 38
 
         for idx, (ing_name, ing_qty) in enumerate(wrapped_ing):
             is_vykhod = norm_text(ing_name).startswith("выход")
-            row_font = fonts["item_bold"] if is_vykhod else fonts["item"]
-            qty_font = fonts["item_bold"] if (is_vykhod or ing_qty) else fonts["item"]
-
-            draw.text((inner_x0, y), ing_name, fill=(24, 28, 34), font=row_font)
+            n_font = fonts["item_bold"] if is_vykhod else fonts["item"]
+            q_font = fonts["item_bold"]
+            draw.text((inner_x0, sy), ing_name, fill=(30, 41, 59), font=n_font)
             if ing_qty:
-                qw = _text_width(draw, ing_qty, qty_font)
-                draw.text((inner_x1 - qw, y), ing_qty, fill=(24, 28, 34), font=qty_font)
+                qw = _text_width(draw, ing_qty, q_font)
+                draw.text((inner_x1 - qw, sy), ing_qty, fill=(15, 23, 42), font=q_font)
+            sy += 34
+            if idx < len(wrapped_ing) - 1 and ing_qty:
+                draw.line([(inner_x0, sy + 3), (inner_x1, sy + 3)], fill=(241, 245, 249), width=1)
+            sy += 10
 
-            y += 36
-            if idx < len(wrapped_ing) - 1:
-                draw.line([(inner_x0, y), (inner_x1, y)], fill=(230, 233, 238), width=1)
-            y += 10
-
-        y += 14
+        y = sec_bot + 22
 
     if wrapped_prep:
-        draw.text((inner_x0, y), "ПРИГОТОВЛЕНИЕ", fill=(17, 20, 26), font=fonts["sec_head"])
-        y += 34
+        sec_top = y
+        sec_bot = y + prep_box_h
+        draw.rounded_rectangle([inner_x0 - 20, sec_top, inner_x1 + 20, sec_bot], radius=16, fill=(255, 255, 255), outline=(226, 232, 240), width=2)
+        py = sec_top + 18
+        draw.text((inner_x0, py), "ПРИГОТОВЛЕНИЕ", fill=(17, 24, 39), font=fonts["sec_head"])
+        py += 38
+
         for p_line in wrapped_prep:
-            draw.text((inner_x0, y), p_line, fill=(36, 40, 48), font=fonts["prep"])
-            y += 33
+            draw.text((inner_x0, py), p_line, fill=(30, 41, 59), font=fonts["prep"])
+            py += 38
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -1086,22 +1157,30 @@ def persist_media_card(card: dict) -> bool:
 
 
 def create_single_ttk_block(block_text: str, category: str, uid: int, username: str) -> tuple[bool, dict | str]:
-    lines = [ln.strip() for ln in (block_text or "").splitlines() if ln.strip()]
-    if not lines:
+    raw = (block_text or "").strip()
+    if not raw:
         return False, "Блок ТТК пуст."
 
-    if len(lines) == 1:
-        single = lines[0]
-        split_match = re.split(r"\s+[—–-]\s+|:\s+", single, maxsplit=1)
-        if len(split_match) == 2 and split_match[0].strip():
-            title = clean_uploaded_title(split_match[0].strip())
-            body = split_match[1].strip()
-        else:
-            title = clean_uploaded_title(single)
-            body = ""
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", raw) if p.strip()]
+    if len(paras) >= 2 and len(paras[0].splitlines()) == 1 and len(paras[0]) <= 80:
+        title = clean_uploaded_title(paras[0])
+        body = "\n\n".join(paras[1:])
     else:
-        title = clean_uploaded_title(lines[0])
-        body = "\n".join(lines[1:])
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            return False, "Блок ТТК пуст."
+        if len(lines) == 1:
+            single = lines[0]
+            split_match = re.split(r"\s+[—–-]\s+|:\s+", single, maxsplit=1)
+            if len(split_match) == 2 and split_match[0].strip():
+                title = clean_uploaded_title(split_match[0].strip())
+                body = split_match[1].strip()
+            else:
+                title = clean_uploaded_title(single)
+                body = ""
+        else:
+            title = clean_uploaded_title(lines[0])
+            body = "\n".join(lines[1:])
 
     if not title:
         return False, "Не удалось определить название ТТК."
@@ -2012,11 +2091,13 @@ def handle_text(msg: types.Message):
         safe_send_text(
             msg.chat.id,
             f"Категория: <b>{esc(chosen_cat or 'без категории')}</b>.\n\n"
-            "Напиши ТТК текстом (можно сразу несколько позиций через <code>---</code> или пустую строку):\n"
-            "• 1-я строка блока — <b>название</b>\n"
-            "• Строки с количеством — в таблицу <b>СОСТАВ</b> (например, <code>Джин 40 мл</code>)\n"
-            "• Строка с описанием приготовления — в блок <b>ПРИГОТОВЛЕНИЕ</b> "
-            "(например, <code>Приготовление: смешать со льдом и процедить</code>)",
+            "Пиши удобно по абзацам (через одну пустую строку):\n"
+            "1. Название коктейля или премикса\n"
+            "<i>(пустая строка)</i>\n"
+            "2. Состав (например: <code>Сок яблочный 1200мл, сок лимона 150мл, водка 600мл</code>)\n"
+            "<i>(пустая строка)</i>\n"
+            "3. Метод приготовления\n\n"
+            "Чтобы добавить сразу несколько позиций в одном сообщении, отделяй их строкой <code>---</code>.",
             reply_markup=back_only_keyboard(),
         )
         return
@@ -2456,7 +2537,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.30] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.31] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
