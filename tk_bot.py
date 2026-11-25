@@ -9,119 +9,148 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import telebot
 from telebot import types
 
-DEFAULT_BOT_TOKEN = "8797743243:AAHw8tDYRr-i9VPlXmjAThnVOmvcJUOx3vA"
-BOT_TOKEN = os.environ.get("BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "5393257255"))
-PORT = int(os.environ.get("PORT", "10000"))
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
-if SUPABASE_URL.endswith("/rest/v1"):
-    SUPABASE_URL = SUPABASE_URL[: -len("/rest/v1")]
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MEDIA_DIR = os.path.join(BASE_DIR, "user_media")
-DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
+# =========================================================
+# КОНФИГУРАЦИЯ
+# =========================================================
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+ADMIN_ID_RAW = (os.getenv("ADMIN_ID") or "").strip()
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN")
+    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
 
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+
+DATA_DIR = os.getenv("DATA_DIR", "data")
+MEDIA_DIR = os.path.join(DATA_DIR, "user_media")
+LOCAL_DB_FILE = os.path.join(DATA_DIR, "tk_bot_state.json")
+os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-DATA_LOCK = threading.RLock()
-STATE_LOCK = threading.RLock()
-FILE_LOCK = threading.RLock()
 
-USER_STATES = {}
-LAST_SYNC_TS = 0.0
-
-RECIPE_SECTIONS = {
-    "author": "Авторские",
-    "classic": "Классические",
-    "menu_cocktails": "Коктейли меню",
-    "tinctures": "Наливки",
-}
-
-ALL_SECTION_TITLES = {
-    **RECIPE_SECTIONS,
-    "dishware": "Посуда",
-    "users": "Пользователи",
-    "support": "Поддержать проект",
-}
-
-BTN_AUTHOR = "🍸 Авторские"
-BTN_CLASSIC = "🥃 Классические"
-BTN_MENU_COCKTAILS = "📋 Коктейли меню"
-BTN_TINCTURES = "🫙 Наливки"
-BTN_DISHWARE = "🥂 Посуда"
+# =========================================================
+# КНОПКИ И ТЕКСТЫ
+# =========================================================
+BTN_RECIPES = "🍸 Рецепты"
+BTN_DISHWARE = "🥃 Посуда"
+BTN_BULK_MEDIA = "📥 Массовая загрузка"
+BTN_MEDIA_LIST = "🖼 Карточки"
+BTN_LOGS = "📜 Логи"
 BTN_USERS = "👥 Пользователи"
-BTN_SUPPORT = "💛 Поддержать проект"
+BTN_SUPPORT = "💬 Поддержка"
+BTN_HELP = "❓ Помощь"
+BTN_BACK = "⬅️ Назад"
+BTN_DONE = "✅ Готово"
+BTN_CANCEL = "❌ Отмена"
 
-BTN_TO_SECTION = {
-    BTN_AUTHOR: "author",
-    BTN_CLASSIC: "classic",
-    BTN_MENU_COCKTAILS: "menu_cocktails",
-    BTN_TINCTURES: "tinctures",
-    BTN_DISHWARE: "dishware",
-    BTN_USERS: "users",
-    BTN_SUPPORT: "support",
+DATA_LOCK = threading.RLock()
+USER_STATES: dict[int, dict] = {}
+LAST_SEEN_SYNC: dict[int, float] = {}
+
+DB: dict = {
+    "recipes": [],
+    "dishware": [],
+    "dishware_logs": [],
+    "users": [],
+    "support": {"id": "main", "text": "Обратитесь к администратору."},
+    "activity_logs": [],
+    "media_cards": [],
 }
 
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server() -> None:
-    def _serve():
-        try:
-            server = ThreadingHTTPServer(("0.0.0.0", PORT), _HealthHandler)
-            print(f"[WEB] Listening on port {PORT}", flush=True)
-            server.serve_forever()
-        except Exception as e:
-            print(f"[WARN] health server error: {e}", flush=True)
-
-    threading.Thread(target=_serve, daemon=True).start()
-
-
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================================================
 def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def esc(value) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def norm_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def exact_title_from_message(msg: types.Message) -> str | None:
+    """Возвращает точное имя файла без расширения (или подпись), без изменений."""
+    if msg.content_type == "document" and msg.document and msg.document.file_name:
+        stem, _ = os.path.splitext(msg.document.file_name)
+        if stem != "":
+            return stem
+    cap = (msg.caption or "").strip()
+    if cap:
+        return cap
+    return None
 
 
 def is_admin(user_id: int) -> bool:
-    return int(user_id) == ADMIN_ID
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return True
+    with DATA_LOCK:
+        for u in DB.get("users", []):
+            if int(u.get("user_id") or 0) == user_id and bool(u.get("is_admin")):
+                return True
+    return False
 
 
-def esc(val) -> str:
-    return html.escape("" if val is None else str(val))
-
-
-def sb_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
-
-
-def sb_request(method: str, path: str, payload=None, prefer: str | None = None):
-    if not sb_enabled():
+def safe_send_text(chat_id: int, text: str, reply_markup=None):
+    try:
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
+    except Exception as e:
+        print(f"[WARN] send_message failed ({chat_id}): {e}", flush=True)
         return None
-    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
+
+
+def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None):
+    try:
+        return bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        print(f"[WARN] edit_message_text failed ({chat_id}/{message_id}): {e}", flush=True)
+        return None
+
+
+def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_RECIPES), types.KeyboardButton(BTN_DISHWARE))
+    kb.row(types.KeyboardButton(BTN_BULK_MEDIA), types.KeyboardButton(BTN_MEDIA_LIST))
+    if is_admin(user_id):
+        kb.row(types.KeyboardButton(BTN_LOGS), types.KeyboardButton(BTN_USERS))
+    kb.row(types.KeyboardButton(BTN_SUPPORT), types.KeyboardButton(BTN_HELP))
+    return kb
+
+
+def bulk_done_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_DONE), types.KeyboardButton(BTN_CANCEL))
+    return kb
+
+
+# =========================================================
+# SUPABASE REST API + ЛОКАЛЬНЫЙ СНИМОК
+# =========================================================
+def sb_request(method: str, table: str, query: str = "", payload=None, prefer: str = ""):
+    if not SUPABASE_ENABLED:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if query:
+        url = f"{url}?{query}"
+
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -129,981 +158,482 @@ def sb_request(method: str, path: str, payload=None, prefer: str | None = None):
     }
     if prefer:
         headers["Prefer"] = prefer
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else []
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+            if not raw:
+                return []
+            return json.loads(raw)
     except urllib.error.HTTPError as e:
-        err_txt = ""
-        try:
-            err_txt = e.read().decode("utf-8")[:250]
-        except Exception:
-            pass
-        print(f"[WARN] Supabase {method} {path} HTTP {e.code}: {err_txt}", flush=True)
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"[WARN] Supabase {method} {table}?{query} HTTP {e.code}: {body}", flush=True)
         return None
     except Exception as e:
-        print(f"[WARN] Supabase {method} {path} error: {e}", flush=True)
+        print(f"[WARN] Supabase {method} {table} failed: {e}", flush=True)
         return None
 
 
-def sb_select(table: str, query_params: str = "") -> list[dict] | None:
-    q = f"?{query_params.lstrip('&')}" if query_params else ""
-    res = sb_request("GET", f"{table}{q}")
-    return res if isinstance(res, list) else None
+def sb_select(table: str, query: str = ""):
+    return sb_request("GET", table, query=query)
 
 
-def sb_upsert(table: str, rows: list[dict] | dict, on_conflict: str | None = None) -> None:
-    if not sb_enabled():
-        return
-    path = f"{table}?on_conflict={urllib.parse.quote(on_conflict)}" if on_conflict else table
-    sb_request("POST", path, payload=rows, prefer="resolution=merge-duplicates,return=minimal")
+def sb_upsert(table: str, row: dict, on_conflict: str = "id"):
+    q = f"on_conflict={urllib.parse.quote(on_conflict)}"
+    return sb_request(
+        "POST",
+        table,
+        query=q,
+        payload=row,
+        prefer="resolution=merge-duplicates,return=representation",
+    )
 
 
-def sb_insert(table: str, rows: list[dict] | dict) -> None:
-    if not sb_enabled():
-        return
-    sb_request("POST", table, payload=rows, prefer="return=minimal")
-
-
-def sb_delete(table: str, filter_query: str) -> None:
-    if not sb_enabled():
-        return
-    sb_request("DELETE", f"{table}?{filter_query.lstrip('&')}", prefer="return=minimal")
-
-
-def default_data() -> dict:
-    return {
-        "recipes": {
-            "author": [],
-            "classic": [],
-            "menu_cocktails": [],
-            "tinctures": [],
-        },
-        "dishware": [],
-        "dishware_logs": [],
-        "support": {
-            "text": "Поддержать проект можно по реквизитам, которые администратор укажет в разделе редактирования."
-        },
-        "users": {},
-        "activity_logs": [],
-    }
-
-
-def save_local_snapshot(snapshot: dict) -> None:
-    with FILE_LOCK:
-        try:
-            tmp = f"{DATA_FILE}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, DATA_FILE)
-        except Exception as e:
-            print(f"[WARN] save_local_snapshot error: {e}", flush=True)
+def sb_delete(table: str, query: str):
+    return sb_request("DELETE", table, query=query)
 
 
 def sync_local_from_memory() -> None:
-    with DATA_LOCK:
-        snap = copy.deepcopy(DB)
-    save_local_snapshot(snap)
-
-
-def load_local_snapshot() -> dict:
-    data = default_data()
-    if not os.path.isfile(DATA_FILE):
-        return data
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            return data
-        for sec in RECIPE_SECTIONS:
-            items = raw.get("recipes", {}).get(sec, [])
-            if isinstance(items, list):
-                data["recipes"][sec] = items
-        if isinstance(raw.get("dishware"), list):
-            data["dishware"] = raw["dishware"]
-        if isinstance(raw.get("dishware_logs"), list):
-            data["dishware_logs"] = raw["dishware_logs"]
-        if isinstance(raw.get("support"), dict) and isinstance(raw["support"].get("text"), str):
-            data["support"]["text"] = raw["support"]["text"]
-        if isinstance(raw.get("users"), dict):
-            data["users"] = raw["users"]
-        if isinstance(raw.get("activity_logs"), list):
-            data["activity_logs"] = raw["activity_logs"]
+        snapshot = copy.deepcopy(DB)
+        with open(LOCAL_DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARN] load_local_snapshot error: {e}", flush=True)
-    return data
+        print(f"[WARN] sync_local_from_memory failed: {e}", flush=True)
 
 
-def load_data() -> dict:
-    global LAST_SYNC_TS
+def load_local_fallback() -> dict:
+    fallback = {
+        "recipes": [],
+        "dishware": [],
+        "dishware_logs": [],
+        "users": [],
+        "support": {"id": "main", "text": "Обратитесь к администратору."},
+        "activity_logs": [],
+        "media_cards": [],
+    }
+    if os.path.isfile(LOCAL_DB_FILE):
+        try:
+            with open(LOCAL_DB_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    fallback.update(loaded)
+        except Exception as e:
+            print(f"[WARN] load_local_fallback failed: {e}", flush=True)
+    return fallback
+
+
+def load_data() -> None:
     with DATA_LOCK:
-        data = load_local_snapshot()
-        if not sb_enabled():
-            return data
+        data = load_local_fallback()
 
-        recipe_rows = sb_select("tk_recipes", "order=created_at.asc")
-        if recipe_rows is not None:
-            data["recipes"] = {k: [] for k in RECIPE_SECTIONS}
-            for r in recipe_rows:
-                sec = r.get("section")
-                if sec not in data["recipes"]:
-                    # Если раздел написан по-русски (например "Коктейли" при ручном INSERT),
-                    # кладём в classic, чтобы рецепт всё равно отображался и находился
-                    sec_lower = str(sec or "").strip().lower()
-                    sec_map = {
-                        "авторские": "author",
-                        "классические": "classic",
-                        "коктейли": "classic",
-                        "коктейли меню": "menu_cocktails",
-                        "наливки": "tinctures",
-                    }
-                    sec = sec_map.get(sec_lower, "classic")
-                data["recipes"][sec].append({
-                    "id": str(r.get("id")),
-                    "title": str(r.get("title") or "Без названия"),
-                    "ingredients": str(r.get("ingredients") or ""),
-                    "method": str(r.get("method") or ""),
-                    "photo_path": r.get("photo_path"),
-                    "photo_file_id": r.get("photo_file_id"),
-                    "created_at": str(r.get("created_at") or now_str()),
-                })
+        recipes = sb_select("tk_recipes", "order=created_at.asc")
+        if recipes is not None:
+            data["recipes"] = recipes
 
-        dish_rows = sb_select("tk_dishware", "order=name.asc")
-        if dish_rows is not None:
-            data["dishware"] = [
+        dishware = sb_select("tk_dishware", "order=name.asc")
+        if dishware is not None:
+            data["dishware"] = dishware
+
+        dishware_logs = sb_select("tk_dishware_logs", "order=id.desc&limit=500")
+        if dishware_logs is not None:
+            data["dishware_logs"] = dishware_logs
+
+        users = sb_select("tk_users", "order=last_seen.desc")
+        if users is not None:
+            data["users"] = users
+
+        support_rows = sb_select("tk_support", "id=eq.main&limit=1")
+        if support_rows:
+            data["support"] = support_rows[0]
+
+        activity_logs = sb_select("tk_activity_logs", "order=id.desc&limit=800")
+        if activity_logs is not None:
+            data["activity_logs"] = activity_logs
+
+        media_rows = sb_select("tk_media_cards", "order=created_at.asc")
+        if media_rows is not None:
+            data["media_cards"] = [
                 {
-                    "id": str(d.get("id")),
-                    "name": str(d.get("name") or "Посуда"),
-                    "qty": int(d.get("qty") or 0),
-                    "unit": str(d.get("unit") or "шт."),
-                    "note": str(d.get("note") or ""),
+                    "id": str(m.get("id")),
+                    "title": str(m.get("title") or ""),
+                    "photo_file_id": m.get("photo_file_id"),
+                    "photo_path": m.get("photo_path"),
+                    "created_at": str(m.get("created_at") or now_str()),
                 }
-                for d in dish_rows
+                for m in media_rows
             ]
+        data.setdefault("media_cards", [])
 
-        dlog_rows = sb_select("tk_dishware_logs", "order=id.desc&limit=300")
-        if dlog_rows is not None:
-            data["dishware_logs"] = list(reversed(dlog_rows))
-
-        sup_rows = sb_select("tk_support", "id=eq.main&limit=1")
-        if sup_rows and isinstance(sup_rows[0].get("text"), str):
-            data["support"]["text"] = sup_rows[0]["text"]
-
-        user_rows = sb_select("tk_users", "order=last_seen.desc")
-        if user_rows is not None:
-            for u in user_rows:
-                uid_str = str(u.get("uid") or u.get("id"))
-                data["users"][uid_str] = {
-                    "id": int(u.get("id") or 0),
-                    "username": str(u.get("username") or "—"),
-                    "name": str(u.get("name") or "Без имени"),
-                    "first_seen": str(u.get("first_seen") or ""),
-                    "last_seen": str(u.get("last_seen") or ""),
-                    "actions_count": int(u.get("actions_count") or 0),
-                }
-
-        act_rows = sb_select("tk_activity_logs", "order=id.desc&limit=800")
-        if act_rows is not None:
-            data["activity_logs"] = list(reversed(act_rows))
-
-        LAST_SYNC_TS = time.time()
-        save_local_snapshot(data)
-        return data
+        DB.clear()
+        DB.update(data)
+        sync_local_from_memory()
 
 
-DB = load_data()
-
-
-def refresh_from_supabase_if_needed(force: bool = False) -> None:
-    global DB
-    if not sb_enabled():
-        return
-    if force or (time.time() - LAST_SYNC_TS > 15):
-        fresh = load_data()
-        with DATA_LOCK:
-            DB = fresh
-
-
-def set_state(user_id: int, state: dict | None) -> None:
-    with STATE_LOCK:
-        if state is None:
-            USER_STATES.pop(user_id, None)
-        else:
-            USER_STATES[user_id] = state
-
-
-def get_state(user_id: int) -> dict | None:
-    with STATE_LOCK:
-        st = USER_STATES.get(user_id)
-        return copy.deepcopy(st) if st is not None else None
-
-
-def persist_recipe(sec: str, item: dict) -> None:
-    sync_local_from_memory()
-    row = {
-        "id": str(item["id"]),
-        "section": sec,
-        "title": str(item.get("title") or ""),
-        "ingredients": str(item.get("ingredients") or ""),
-        "method": str(item.get("method") or ""),
-        "photo_path": item.get("photo_path"),
-        "photo_file_id": item.get("photo_file_id"),
-        "created_at": str(item.get("created_at") or now_str()),
+def log_activity(user_id: int, username: str, action: str, details: str = "") -> None:
+    entry = {
+        "id": f"act_{uuid.uuid4().hex[:12]}",
+        "user_id": int(user_id),
+        "username": username or "",
+        "action": action,
+        "details": details,
+        "created_at": now_str(),
     }
-    sb_upsert("tk_recipes", row, "id")
+    with DATA_LOCK:
+        DB.setdefault("activity_logs", []).insert(0, entry)
+        DB["activity_logs"] = DB["activity_logs"][:800]
+        sync_local_from_memory()
+    sb_upsert("tk_activity_logs", entry, "id")
 
 
-def delete_recipe_remote(item_id: str) -> None:
-    sync_local_from_memory()
-    sb_delete("tk_recipes", f"id=eq.{urllib.parse.quote(str(item_id))}")
-
-
-def persist_dishware(item: dict, log_entry: dict | None = None) -> None:
-    sync_local_from_memory()
-    row = {
-        "id": str(item["id"]),
-        "name": str(item.get("name") or ""),
-        "qty": int(item.get("qty") or 0),
-        "unit": str(item.get("unit") or "шт."),
-        "note": str(item.get("note") or ""),
-    }
-    sb_upsert("tk_dishware", row, "id")
-    if log_entry:
-        sb_insert("tk_dishware_logs", {
-            "ts": str(log_entry.get("ts") or now_str()),
-            "name": str(log_entry.get("name") or ""),
-            "delta": int(log_entry.get("delta") or 0),
-            "after": int(log_entry.get("after") or 0),
-            "reason": str(log_entry.get("reason") or ""),
-        })
-
-
-def delete_dishware_remote(item_id: str) -> None:
-    sync_local_from_memory()
-    sb_delete("tk_dishware", f"id=eq.{urllib.parse.quote(str(item_id))}")
-
-
-def persist_support(text_val: str) -> None:
-    sync_local_from_memory()
-    sb_upsert("tk_support", {"id": "main", "text": str(text_val)}, "id")
-
-
-def track_user_and_action(user, action_text: str) -> None:
+def touch_user(msg: types.Message) -> None:
+    user = msg.from_user
     if not user:
         return
-    uid = str(user.id)
-    username = f"@{user.username}" if getattr(user, "username", None) else "—"
-    first_name = (getattr(user, "first_name", "") or "").strip()
-    last_name = (getattr(user, "last_name", "") or "").strip()
-    full_name = f"{first_name} {last_name}".strip() or "Без имени"
-    ts = now_str()
-
+    uid = int(user.id)
+    now_ts = time.time()
     with DATA_LOCK:
-        u = DB["users"].get(uid)
-        if not u:
-            u = {
-                "id": user.id,
-                "username": username,
-                "name": full_name,
-                "first_seen": ts,
-                "last_seen": ts,
-                "actions_count": 0,
-            }
-        u["username"] = username
-        u["name"] = full_name
-        u["last_seen"] = ts
-        u["actions_count"] = int(u.get("actions_count", 0)) + 1
-        DB["users"][uid] = copy.deepcopy(u)
-
-        ev = {
-            "ts": ts,
-            "user_id": user.id,
-            "username": username,
-            "name": full_name,
-            "action": action_text,
+        users = DB.setdefault("users", [])
+        existing = next((u for u in users if int(u.get("user_id") or 0) == uid), None)
+        row = {
+            "user_id": uid,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "is_admin": bool(existing.get("is_admin")) if existing else (uid == ADMIN_ID),
+            "last_seen": now_str(),
         }
-        DB["activity_logs"].append(ev)
-        if len(DB["activity_logs"]) > 800:
-            DB["activity_logs"] = DB["activity_logs"][-800:]
+        if existing:
+            existing.update(row)
+        else:
+            users.append(row)
+        sync_local_from_memory()
 
+    if now_ts - LAST_SEEN_SYNC.get(uid, 0.0) > 60.0:
+        LAST_SEEN_SYNC[uid] = now_ts
+        sb_upsert("tk_users", row, "user_id")
+
+
+# =========================================================
+# КАРТОЧКИ ФАЙЛОВ / PNG (tk_media_cards)
+# =========================================================
+def persist_media_card(card: dict) -> None:
     sync_local_from_memory()
+    sb_upsert(
+        "tk_media_cards",
+        {
+            "id": str(card["id"]),
+            "title": str(card.get("title") or ""),
+            "photo_file_id": card.get("photo_file_id"),
+            "photo_path": card.get("photo_path"),
+            "created_at": str(card.get("created_at") or now_str()),
+        },
+        "id",
+    )
 
 
-def search_entries(raw_query: str) -> list[dict]:
-    refresh_from_supabase_if_needed()
-    cleaned = re.sub(r"\s+", " ", (raw_query or "").strip().lower())
-    without_word = re.sub(r"^(коктейль|коктейли|рецепт|наливка|наливки)\s+", "", cleaned).strip()
-    target = without_word if without_word else cleaned
-    if not target:
-        return []
+def save_incoming_media_card(msg: types.Message) -> tuple[bool, dict | str]:
+    """Сохраняет файл/PNG с точным именем файла (без расширения) в DB и Supabase."""
+    exact_title = exact_title_from_message(msg)
+    if not exact_title:
+        return False, "Не удалось определить имя файла — отправьте PNG как файл/документ (или добавьте подпись)."
 
-    parts = [p for p in target.split(" ") if p]
-    results = []
+    file_id = None
+    ext = ".png"
+    original_name = exact_title
+
+    if msg.content_type == "document" and msg.document:
+        file_id = msg.document.file_id
+        original_name = msg.document.file_name or exact_title
+        _, raw_ext = os.path.splitext(original_name)
+        if raw_ext:
+            ext = raw_ext.lower()
+    elif msg.content_type == "photo" and msg.photo:
+        file_id = msg.photo[-1].file_id
+        ext = ".jpg"
+    else:
+        return False, "Поддерживаются только файлы/документы (например, .png) и изображения."
+
+    card_id = f"media_{uuid.uuid4().hex[:10]}"
+    safe_disk_name = f"{card_id}{ext}"
+    local_path = os.path.join(MEDIA_DIR, safe_disk_name)
+
+    try:
+        file_info = bot.get_file(file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        with open(local_path, "wb") as out:
+            out.write(downloaded)
+    except Exception as e:
+        print(f"[WARN] download_file failed ({exact_title}): {e}", flush=True)
+        local_path = None
+
+    card = {
+        "id": card_id,
+        "title": exact_title,
+        "photo_file_id": file_id,
+        "photo_path": local_path,
+        "created_at": now_str(),
+    }
 
     with DATA_LOCK:
-        for sec, sec_title in RECIPE_SECTIONS.items():
-            for item in DB["recipes"].get(sec, []):
-                if not isinstance(item, dict):
-                    continue
-                title = str(item.get("title") or "Без названия")
-                ingredients = str(item.get("ingredients") or "")
-                method = str(item.get("method") or "")
-                hay = f"{title} {ingredients} {method}".lower()
-                if target in hay or all(p in hay for p in parts):
-                    results.append({
-                        "kind": "recipe",
-                        "section": sec,
-                        "section_title": sec_title,
-                        "id": str(item.get("id")),
-                        "title": title,
-                    })
+        cards = DB.setdefault("media_cards", [])
+        # Если карточка с точно таким же title уже есть — обновляем её файл/file_id
+        existing = next((c for c in cards if str(c.get("title") or "") == exact_title), None)
+        if existing:
+            existing["photo_file_id"] = card["photo_file_id"]
+            existing["photo_path"] = card["photo_path"]
+            existing["created_at"] = card["created_at"]
+            card = existing
+        else:
+            cards.append(card)
+        persist_media_card(card)
 
-        for d in DB.get("dishware", []):
-            if not isinstance(d, dict):
-                continue
-            name = str(d.get("name") or "Посуда")
-            note = str(d.get("note") or "")
-            qty = int(d.get("qty") or 0)
-            unit = str(d.get("unit") or "шт.")
-            hay = f"{name} {note}".lower()
-            if target in hay or all(p in hay for p in parts):
-                results.append({
-                    "kind": "dishware",
-                    "section": "dishware",
-                    "section_title": "Посуда",
-                    "id": str(d.get("id")),
-                    "title": f"{name} ({qty} {unit})",
-                })
-
-    return results[:15]
+    return True, card
 
 
-def safe_send_text(chat_id: int, text: str, reply_markup=None) -> None:
-    try:
-        bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
-    except Exception:
-        plain = html.unescape(text)
-        try:
-            bot.send_message(chat_id, plain, reply_markup=reply_markup, parse_mode=None, disable_web_page_preview=True)
-        except Exception as e:
-            print(f"[ERROR] safe_send_text: {e}", flush=True)
-
-
-def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None) -> None:
-    try:
-        bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        safe_send_text(chat_id, text, reply_markup=reply_markup)
-
-
-def safe_send_recipe(chat_id: int, item: dict, reply_markup=None) -> None:
-    title = esc(item.get("title", "Без названия"))
-    ingredients = esc(item.get("ingredients", ""))
-    method = esc(item.get("method", ""))
-
-    lines = [f"<b>{title}</b>"]
-    if item.get("ingredients"):
-        lines.append(f"\n<b>Состав:</b>\n{ingredients}")
-    if item.get("method"):
-        lines.append(f"\n<b>Приготовление:</b>\n{method}")
-    caption = "\n".join(lines)
-
-    file_id = item.get("photo_file_id")
-    photo_path = item.get("photo_path")
+def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
+    title_raw = str(card.get("title") or "")
+    caption = f"<b>{esc(title_raw)}</b>"
+    file_id = card.get("photo_file_id")
+    photo_path = card.get("photo_path")
 
     if file_id:
         try:
-            if len(caption) <= 1024:
-                bot.send_photo(chat_id, file_id, caption=caption, reply_markup=reply_markup)
-            else:
-                bot.send_photo(chat_id, file_id)
-                safe_send_text(chat_id, caption, reply_markup=reply_markup)
+            bot.send_document(chat_id, file_id, caption=caption, reply_markup=reply_markup)
             return
-        except Exception as e:
-            print(f"[WARN] send_photo by file_id failed: {e}", flush=True)
+        except Exception:
+            try:
+                bot.send_photo(chat_id, file_id, caption=caption, reply_markup=reply_markup)
+                return
+            except Exception as e:
+                print(f"[WARN] send media by file_id failed: {e}", flush=True)
 
     if photo_path and os.path.isfile(photo_path):
         try:
-            with open(photo_path, "rb") as img:
-                if len(caption) <= 1024:
-                    sent = bot.send_photo(chat_id, img, caption=caption, reply_markup=reply_markup)
-                else:
-                    sent = bot.send_photo(chat_id, img)
-                    safe_send_text(chat_id, caption, reply_markup=reply_markup)
-            if sent and sent.photo:
-                item["photo_file_id"] = sent.photo[-1].file_id
-                sync_local_from_memory()
+            with open(photo_path, "rb") as f:
+                bot.send_document(chat_id, f, caption=caption, reply_markup=reply_markup)
             return
         except Exception as e:
-            print(f"[WARN] send_photo failed: {e}", flush=True)
+            print(f"[WARN] send media from disk failed: {e}", flush=True)
 
     safe_send_text(chat_id, caption, reply_markup=reply_markup)
 
 
-def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton(BTN_AUTHOR), types.KeyboardButton(BTN_CLASSIC))
-    kb.row(types.KeyboardButton(BTN_MENU_COCKTAILS), types.KeyboardButton(BTN_TINCTURES))
-    kb.row(types.KeyboardButton(BTN_DISHWARE), types.KeyboardButton(BTN_SUPPORT))
-    if is_admin(user_id):
-        kb.row(types.KeyboardButton(BTN_USERS))
-    return kb
-
-
-def cancel_keyboard() -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton("❌ Отмена"))
-    return kb
-
-
-def skip_or_cancel_keyboard() -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton("⏭ Пропустить"), types.KeyboardButton("❌ Отмена"))
-    return kb
-
-
-def recipe_section_inline(section: str, user_id: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=1)
+def find_media_matches(query: str) -> list[dict]:
+    q = norm_text(query)
+    if not q:
+        return []
     with DATA_LOCK:
-        items = list(DB["recipes"].get(section, []))
-    for idx, item in enumerate(items):
-        if not isinstance(item, dict):
-            continue
-        item_id = str(item.get("id") or f"idx_{idx}")
-        title = str(item.get("title") or "Без названия")
-        kb.add(types.InlineKeyboardButton(text=f"📄 {title[:60]}", callback_data=f"r_view:{section}:{item_id}"))
-
-    if is_admin(user_id):
-        kb.row(
-            types.InlineKeyboardButton("➕ Добавить", callback_data=f"r_add:{section}"),
-            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"r_del_pick:{section}"),
-        )
-    return kb
+        cards = list(DB.get("media_cards", []))
+    exact = [c for c in cards if norm_text(c.get("title")) == q]
+    if exact:
+        return exact
+    return [c for c in cards if q in norm_text(c.get("title"))]
 
 
-def recipe_item_inline(section: str, item_id: str, user_id: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    if is_admin(user_id):
-        kb.add(
-            types.InlineKeyboardButton("✏️ Изменить", callback_data=f"r_edit_menu:{section}:{item_id}"),
-            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"r_del_ask:{section}:{item_id}"),
-        )
-    kb.add(types.InlineKeyboardButton("⬅️ Назад в раздел", callback_data=f"sec_open:{section}"))
-    return kb
-
-
-def recipe_edit_fields_inline(section: str, item_id: str) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("Название", callback_data=f"r_ef:{section}:{item_id}:title"),
-        types.InlineKeyboardButton("Состав", callback_data=f"r_ef:{section}:{item_id}:ingredients"),
-        types.InlineKeyboardButton("Приготовление", callback_data=f"r_ef:{section}:{item_id}:method"),
-        types.InlineKeyboardButton("Картинка", callback_data=f"r_ef:{section}:{item_id}:photo"),
-    )
-    kb.add(types.InlineKeyboardButton("⬅️ К карточке", callback_data=f"r_view:{section}:{item_id}"))
-    return kb
-
-
-def dishware_list_inline(user_id: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    with DATA_LOCK:
-        items = list(DB["dishware"])
-    for d in items:
-        qty = int(d.get("qty", 0))
-        unit = d.get("unit") or "шт."
-        kb.add(types.InlineKeyboardButton(text=f"🥂 {d.get('name', 'Посуда')} — {qty} {unit}", callback_data=f"d_view:{d['id']}"))
-    if is_admin(user_id):
-        kb.row(types.InlineKeyboardButton("➕ Добавить посуду", callback_data="d_add"))
-    return kb
-
-
-def dishware_item_inline(item_id: str, user_id: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup()
-    if is_admin(user_id):
-        kb.row(
-            types.InlineKeyboardButton("➖ 1", callback_data=f"d_delta:{item_id}:-1"),
-            types.InlineKeyboardButton("➕ 1", callback_data=f"d_delta:{item_id}:1"),
-        )
-        kb.row(
-            types.InlineKeyboardButton("✏️ Задать число", callback_data=f"d_set:{item_id}"),
-            types.InlineKeyboardButton("🗑 Удалить", callback_data=f"d_del_ask:{item_id}"),
-        )
-    kb.add(types.InlineKeyboardButton("⬅️ К списку посуды", callback_data="sec_open:dishware"))
-    return kb
-
-
-def render_recipe_section(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
-    refresh_from_supabase_if_needed()
-    title = RECIPE_SECTIONS[section]
-    with DATA_LOCK:
-        count = len(DB["recipes"].get(section, []))
-    text = f"<b>{esc(title)}</b>\nПозиций в разделе: <b>{count}</b>\nНажмите карточку или кнопку управления:"
-    kb = recipe_section_inline(section, user_id)
-    if edit_msg_id:
-        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
-    else:
-        safe_send_text(chat_id, text, reply_markup=kb)
-
-
-def render_dishware_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
-    refresh_from_supabase_if_needed()
-    with DATA_LOCK:
-        items = list(DB["dishware"])
-    if not items:
-        text = "<b>🥂 Посуда</b>\n\nСписок пока пуст."
-    else:
-        lines = ["<b>🥂 Посуда:</b>\n"]
-        for d in items:
-            lines.append(f"• <b>{esc(d.get('name', 'Посуда'))}</b>: <b>{int(d.get('qty', 0))}</b> {esc(d.get('unit') or 'шт.')}")
-        text = "\n".join(lines)
-    kb = dishware_list_inline(user_id)
-    if edit_msg_id:
-        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
-    else:
-        safe_send_text(chat_id, text, reply_markup=kb)
-
-
-def render_dishware_item(chat_id: int, user_id: int, item_id: str, edit_msg_id: int | None = None) -> None:
-    with DATA_LOCK:
-        item = next((x for x in DB["dishware"] if x["id"] == item_id), None)
-    if not item:
-        safe_send_text(chat_id, "Позиция не найдена.", reply_markup=main_menu_keyboard(user_id))
-        return
-    text = f"<b>🥂 {esc(item.get('name', 'Посуда'))}</b>\nОстаток: <b>{int(item.get('qty', 0))}</b> {esc(item.get('unit') or 'шт.')}"
-    kb = dishware_item_inline(item_id, user_id)
-    if edit_msg_id:
-        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
-    else:
-        safe_send_text(chat_id, text, reply_markup=kb)
-
-
-def render_support_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
-    with DATA_LOCK:
-        raw_text = DB["support"].get("text", "")
-    kb = None
-    if is_admin(user_id):
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("✏️ Редактировать текст", callback_data="sup_edit"))
-    text = f"<b>💛 Поддержать проект</b>\n\n{esc(raw_text)}"
-    if edit_msg_id:
-        safe_edit_text(chat_id, edit_msg_id, text, reply_markup=kb)
-    else:
-        safe_send_text(chat_id, text, reply_markup=kb)
-
-
-def render_users_section(chat_id: int, user_id: int, edit_msg_id: int | None = None) -> None:
-    if not is_admin(user_id):
-        return
-    with DATA_LOCK:
-        users = list(DB["users"].values())
-    users.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
-    lines = [f"<b>👥 Пользователи ({len(users)})</b>\n"]
-    for u in users[:25]:
-        lines.append(f"• <b>{esc(u.get('name'))}</b> ({esc(u.get('username'))}) — {int(u.get('actions_count', 0))} действ.")
-    text = "\n".join(lines)
-    if edit_msg_id:
-        safe_edit_text(chat_id, edit_msg_id, text)
-    else:
-        safe_send_text(chat_id, text)
-
-
-def open_section_by_key(chat_id: int, user_id: int, section: str, edit_msg_id: int | None = None) -> None:
-    if section in RECIPE_SECTIONS:
-        render_recipe_section(chat_id, user_id, section, edit_msg_id=edit_msg_id)
-    elif section == "dishware":
-        render_dishware_section(chat_id, user_id, edit_msg_id=edit_msg_id)
-    elif section == "support":
-        render_support_section(chat_id, user_id, edit_msg_id=edit_msg_id)
-    elif section == "users":
-        render_users_section(chat_id, user_id, edit_msg_id=edit_msg_id)
-
-
-def extract_media(msg: types.Message) -> tuple[bytes | None, str | None, str | None]:
-    if msg.content_type == "photo" and msg.photo:
-        best = msg.photo[-1]
-        info = bot.get_file(best.file_id)
-        return bot.download_file(info.file_path), ".jpg", best.file_id
-    if msg.content_type == "document" and msg.document:
-        doc = msg.document
-        ext = os.path.splitext(doc.file_name or "")[1].lower() or ".jpg"
-        if ext in (".png", ".jpg", ".jpeg", ".webp") or (doc.mime_type or "").startswith("image/"):
-            info = bot.get_file(doc.file_id)
-            raw = bot.download_file(info.file_path)
-            sent = bot.send_photo(msg.chat.id, raw)
-            fid = sent.photo[-1].file_id if sent and sent.photo else None
-            return raw, ext, fid
-    return None, None, None
-
-
-@bot.message_handler(commands=["start", "menu", "cancel"])
-def cmd_start_or_cancel(message: types.Message):
-    uid = message.from_user.id
-    set_state(uid, None)
-    refresh_from_supabase_if_needed(force=True)
-    track_user_and_action(message.from_user, "start/menu")
+# =========================================================
+# ПОИСК И КОМАНДЫ БОТА
+# =========================================================
+def start_bulk_mode(msg: types.Message) -> None:
+    uid = msg.from_user.id
+    USER_STATES[uid] = {"mode": "media_bulk_add", "count": 0, "titles": []}
     safe_send_text(
-        message.chat.id,
-        "<b>Главное меню</b>\nВыберите раздел или напишите слово для поиска (например: <code>негрони</code>):",
+        msg.chat.id,
+        "📥 <b>Режим массовой загрузки файлов/PNG включён.</b>\n\n"
+        "Отправляй файлы подряд (например, 10+ PNG). Название запишется в базу "
+        "<b>один в один</b> как имя файла без расширения (например, файл <code>коктейль Алексей.png</code> → "
+        "название <code>коктейль Алексей</code>).\n\n"
+        "Когда закончишь — нажми <b>✅ Готово</b>.",
+        reply_markup=bulk_done_keyboard(),
+    )
+
+
+def finish_bulk_mode(msg: types.Message) -> None:
+    uid = msg.from_user.id
+    st = USER_STATES.pop(uid, {})
+    count = int(st.get("count") or 0)
+    titles = st.get("titles") or []
+    preview = "\n".join(f"• {esc(t)}" for t in titles[:20])
+    extra = f"\n…и ещё {len(titles) - 20}" if len(titles) > 20 else ""
+    safe_send_text(
+        msg.chat.id,
+        f"✅ Загрузка завершена. Сохранено файлов: <b>{count}</b>"
+        + (f"\n\n{preview}{extra}" if preview else ""),
         reply_markup=main_menu_keyboard(uid),
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "❌ Отмена")
-def btn_cancel(message: types.Message):
-    uid = message.from_user.id
-    st = get_state(uid)
-    set_state(uid, None)
-    safe_send_text(message.chat.id, "Отменено.", reply_markup=main_menu_keyboard(uid))
-    if st and st.get("return_section"):
-        open_section_by_key(message.chat.id, uid, st["return_section"])
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(msg: types.Message):
+    touch_user(msg)
+    USER_STATES.pop(msg.from_user.id, None)
+    safe_send_text(
+        msg.chat.id,
+        "Привет! Бот готов к работе.\n"
+        "• Напиши любое название — найду в карточках/рецептах/посуде.\n"
+        "• Нажми <b>📥 Массовая загрузка</b> или отправь <code>/bulk</code> для загрузки пачки PNG/файлов.",
+        reply_markup=main_menu_keyboard(msg.from_user.id),
+    )
 
 
-@bot.message_handler(func=lambda m: m.text in BTN_TO_SECTION)
-def handle_main_menu_buttons(message: types.Message):
-    uid = message.from_user.id
-    sec = BTN_TO_SECTION[message.text]
-    if sec == "users" and not is_admin(uid):
-        return
-    set_state(uid, None)
-    track_user_and_action(message.from_user, f"раздел {ALL_SECTION_TITLES.get(sec, sec)}")
-    open_section_by_key(message.chat.id, uid, sec)
+@bot.message_handler(commands=["bulk"])
+def cmd_bulk(msg: types.Message):
+    touch_user(msg)
+    start_bulk_mode(msg)
 
 
-@bot.message_handler(content_types=["text", "photo", "document"], func=lambda m: get_state(m.from_user.id) is not None)
-def handle_wizard_input(message: types.Message):
-    uid = message.from_user.id
-    if not is_admin(uid):
-        set_state(uid, None)
-        return
-    st = get_state(uid)
-    if not st:
-        return
+@bot.message_handler(content_types=["document", "photo"])
+def handle_media_upload(msg: types.Message):
+    touch_user(msg)
+    uid = msg.from_user.id
+    st = USER_STATES.get(uid) or {}
 
-    mode = st.get("mode")
-    step = st.get("step")
-    data = st.get("data", {})
-    txt = (message.text or "").strip()
-
-    if mode == "recipe_add":
-        sec = data["section"]
-        if step == "title":
-            if not txt:
-                safe_send_text(message.chat.id, "Введите название:")
-                return
-            data["title"] = txt
-            set_state(uid, {"mode": mode, "step": "ingredients", "data": data, "return_section": sec})
-            safe_send_text(message.chat.id, "Введите состав (или <code>-</code>):")
-            return
-        if step == "ingredients":
-            data["ingredients"] = "" if txt == "-" else txt
-            set_state(uid, {"mode": mode, "step": "method", "data": data, "return_section": sec})
-            safe_send_text(message.chat.id, "Введите приготовление (или <code>-</code>):")
-            return
-        if step == "method":
-            data["method"] = "" if txt == "-" else txt
-            set_state(uid, {"mode": mode, "step": "photo", "data": data, "return_section": sec})
-            safe_send_text(message.chat.id, "Отправьте картинку или нажмите «⏭ Пропустить»:", reply_markup=skip_or_cancel_keyboard())
-            return
-        if step == "photo":
-            photo_path = None
-            file_id = None
-            item_id = uuid.uuid4().hex[:8]
-            raw_bytes, ext, file_id = extract_media(message)
-            if raw_bytes:
-                safe_ext = ext if ext in (".png", ".jpg", ".jpeg", ".webp") else ".jpg"
-                photo_path = os.path.join(MEDIA_DIR, f"{sec}_{item_id}{safe_ext}")
-                with open(photo_path, "wb") as f:
-                    f.write(raw_bytes)
-            elif txt != "⏭ Пропустить":
-                safe_send_text(message.chat.id, "Пришлите картинку или нажмите «⏭ Пропустить».", reply_markup=skip_or_cancel_keyboard())
-                return
-
-            new_item = {
-                "id": item_id,
-                "title": data["title"],
-                "ingredients": data.get("ingredients", ""),
-                "method": data.get("method", ""),
-                "photo_path": photo_path,
-                "photo_file_id": file_id,
-                "created_at": now_str(),
-            }
-            with DATA_LOCK:
-                DB["recipes"].setdefault(sec, []).append(new_item)
-                persist_recipe(sec, new_item)
-            set_state(uid, None)
-            safe_send_text(message.chat.id, f"✅ Добавлено: <b>{esc(new_item['title'])}</b>", reply_markup=main_menu_keyboard(uid))
-            render_recipe_section(message.chat.id, uid, sec)
-            return
-
-    if mode == "recipe_edit_field":
-        sec = data["section"]
-        item_id = data["item_id"]
-        field = data["field"]
-        if field == "photo":
-            raw_bytes, ext, file_id = extract_media(message)
-            if txt == "⏭ Пропустить":
-                new_photo, new_file_id = None, None
-            elif raw_bytes:
-                safe_ext = ext if ext in (".png", ".jpg", ".jpeg", ".webp") else ".jpg"
-                new_photo = os.path.join(MEDIA_DIR, f"{sec}_{item_id}_{uuid.uuid4().hex[:4]}{safe_ext}")
-                with open(new_photo, "wb") as f:
-                    f.write(raw_bytes)
-                new_file_id = file_id
-            else:
-                safe_send_text(message.chat.id, "Отправьте фото или «⏭ Пропустить»:", reply_markup=skip_or_cancel_keyboard())
-                return
-            with DATA_LOCK:
-                item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
-                if item:
-                    item["photo_path"] = new_photo
-                    item["photo_file_id"] = new_file_id
-                    persist_recipe(sec, item)
-            set_state(uid, None)
-            safe_send_text(message.chat.id, "✅ Картинка обновлена.", reply_markup=main_menu_keyboard(uid))
-            if item:
-                safe_send_recipe(message.chat.id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
-            return
-
-        if not txt:
-            safe_send_text(message.chat.id, "Введите значение:")
-            return
-        val = "" if txt == "-" else txt
-        with DATA_LOCK:
-            item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
-            if item:
-                item[field] = val
-                persist_recipe(sec, item)
-        set_state(uid, None)
-        safe_send_text(message.chat.id, "✅ Сохранено.", reply_markup=main_menu_keyboard(uid))
-        if item:
-            safe_send_recipe(message.chat.id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
+    ok, res = save_incoming_media_card(msg)
+    if not ok:
+        safe_send_text(msg.chat.id, f"⚠️ {esc(res)}")
         return
 
-    if mode == "dishware_add":
-        if step == "name":
-            if not txt:
-                safe_send_text(message.chat.id, "Введите название посуды:")
-                return
-            data["name"] = txt
-            set_state(uid, {"mode": mode, "step": "qty", "data": data, "return_section": "dishware"})
-            safe_send_text(message.chat.id, "Введите количество (целое число):")
-            return
-        if step == "qty":
-            try:
-                qty = int(txt)
-            except ValueError:
-                safe_send_text(message.chat.id, "Нужно целое число:")
-                return
-            new_d = {"id": uuid.uuid4().hex[:8], "name": data["name"], "qty": qty, "unit": "шт.", "note": ""}
-            with DATA_LOCK:
-                DB["dishware"].append(new_d)
-                persist_dishware(new_d)
-            set_state(uid, None)
-            safe_send_text(message.chat.id, f"✅ Добавлено: <b>{esc(new_d['name'])}</b> ({qty} шт.)", reply_markup=main_menu_keyboard(uid))
-            render_dishware_section(message.chat.id, uid)
-            return
+    card = res
+    title = str(card.get("title") or "")
+    log_activity(uid, msg.from_user.username or "", "MEDIA_ADD", title)
 
-    if mode == "dishware_adjust":
-        try:
-            num = int(txt)
-        except ValueError:
-            safe_send_text(message.chat.id, "Введите целое число:")
-            return
-        item_id = data["item_id"]
-        with DATA_LOCK:
-            d = next((x for x in DB["dishware"] if x["id"] == item_id), None)
-            if d:
-                d["qty"] = num
-                persist_dishware(d)
-        set_state(uid, None)
-        safe_send_text(message.chat.id, "✅ Остаток обновлён.", reply_markup=main_menu_keyboard(uid))
-        render_dishware_item(message.chat.id, uid, item_id)
-        return
-
-    if mode == "support_edit":
-        if not txt:
-            safe_send_text(message.chat.id, "Введите текст:")
-            return
-        with DATA_LOCK:
-            DB["support"]["text"] = txt
-            persist_support(txt)
-        set_state(uid, None)
-        safe_send_text(message.chat.id, "✅ Текст обновлён.", reply_markup=main_menu_keyboard(uid))
-        render_support_section(message.chat.id, uid)
-        return
-
-
-@bot.message_handler(content_types=["text"], func=lambda m: not (m.text or "").startswith("/"))
-def handle_text_search(message: types.Message):
-    uid = message.from_user.id
-    query = (message.text or "").strip()
-    print(f"[TEXT_SEARCH] uid={uid} chat={message.chat.id} state={get_state(uid)} query={query!r}", flush=True)
-    if not query:
-        return
-    if get_state(uid) is not None:
-        return
-
-    matches = search_entries(query)
-    if not matches:
+    if st.get("mode") == "media_bulk_add":
+        st["count"] = int(st.get("count") or 0) + 1
+        st.setdefault("titles", []).append(title)
         safe_send_text(
-            message.chat.id,
-            f"По запросу <b>«{esc(query)}»</b> ничего не найдено.",
+            msg.chat.id,
+            f"➕ Сохранено (#{st['count']}): <b>{esc(title)}</b>",
+            reply_markup=bulk_done_keyboard(),
+        )
+    else:
+        safe_send_text(
+            msg.chat.id,
+            f"✅ Сохранено: <b>{esc(title)}</b>",
+            reply_markup=main_menu_keyboard(uid),
+        )
+
+
+@bot.message_handler(content_types=["text"])
+def handle_text(msg: types.Message):
+    touch_user(msg)
+    uid = msg.from_user.id
+    text = (msg.text or "").strip()
+    st = USER_STATES.get(uid) or {}
+
+    if st.get("mode") == "media_bulk_add":
+        if text == BTN_DONE:
+            finish_bulk_mode(msg)
+            return
+        if text == BTN_CANCEL:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "❌ Режим массовой загрузки отменён.", reply_markup=main_menu_keyboard(uid))
+            return
+        safe_send_text(
+            msg.chat.id,
+            "Сейчас активен режим массовой загрузки. Кидай файлы/PNG или нажми <b>✅ Готово</b>.",
+            reply_markup=bulk_done_keyboard(),
+        )
+        return
+
+    if text == BTN_BULK_MEDIA:
+        start_bulk_mode(msg)
+        return
+
+    if text == BTN_MEDIA_LIST:
+        with DATA_LOCK:
+            cards = list(DB.get("media_cards", []))
+        if not cards:
+            safe_send_text(msg.chat.id, "Сохранённых карточек пока нет.", reply_markup=main_menu_keyboard(uid))
+            return
+        lines = [f"• {esc(c.get('title') or '')}" for c in cards[:50]]
+        safe_send_text(
+            msg.chat.id,
+            f"🖼 <b>Карточки ({len(cards)}):</b>\n\n" + "\n".join(lines),
             reply_markup=main_menu_keyboard(uid),
         )
         return
 
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    lines = [f"<b>🔎 Найдено по «{esc(query)}»:</b>\n"]
-    for idx, m_item in enumerate(matches, start=1):
-        lines.append(f"{idx}. <b>{esc(m_item['title'])}</b> — <i>{esc(m_item['section_title'])}</i>")
-        if m_item["kind"] == "recipe":
-            kb.add(types.InlineKeyboardButton(text=f"📄 {m_item['title'][:55]}", callback_data=f"r_view:{m_item['section']}:{m_item['id']}"))
-        else:
-            kb.add(types.InlineKeyboardButton(text=f"🥂 {m_item['title'][:55]}", callback_data=f"d_view:{m_item['id']}"))
-    safe_send_text(message.chat.id, "\n".join(lines), reply_markup=kb)
-
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call: types.CallbackQuery):
-    uid = call.from_user.id
-    chat_id = call.message.chat.id
-    msg_id = call.message.message_id
-    data = call.data or ""
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception:
-        pass
-
-    if data.startswith("sec_open:"):
-        sec = data.split(":", 1)[1]
-        if sec == "users" and not is_admin(uid):
-            return
-        set_state(uid, None)
-        open_section_by_key(chat_id, uid, sec, edit_msg_id=msg_id)
-    elif data.startswith("r_view:"):
-        _, sec, item_id = data.split(":", 2)
-        with DATA_LOCK:
-            item = next((x for x in DB["recipes"].get(sec, []) if x["id"] == item_id), None)
-        if item:
-            safe_send_recipe(chat_id, item, reply_markup=recipe_item_inline(sec, item_id, uid))
-    elif data.startswith("r_add:"):
-        if not is_admin(uid):
-            return
-        sec = data.split(":", 1)[1]
-        set_state(uid, {"mode": "recipe_add", "step": "title", "data": {"section": sec}, "return_section": sec})
-        safe_send_text(chat_id, f"<b>Добавление в «{esc(RECIPE_SECTIONS[sec])}»</b>\n\nВведите название:", reply_markup=cancel_keyboard())
-    elif data.startswith("r_edit_menu:"):
-        if not is_admin(uid):
-            return
-        _, sec, item_id = data.split(":", 2)
-        safe_send_text(chat_id, "Что меняем?", reply_markup=recipe_edit_fields_inline(sec, item_id))
-    elif data.startswith("r_ef:"):
-        if not is_admin(uid):
-            return
-        _, sec, item_id, field = data.split(":", 3)
-        set_state(uid, {"mode": "recipe_edit_field", "step": "value", "data": {"section": sec, "item_id": item_id, "field": field}, "return_section": sec})
-        safe_send_text(chat_id, "Введите новое значение (или отправьте фото):", reply_markup=skip_or_cancel_keyboard() if field == "photo" else cancel_keyboard())
-    elif data.startswith("r_del_pick:"):
-        if not is_admin(uid):
-            return
-        sec = data.split(":", 1)[1]
-        with DATA_LOCK:
-            items = list(DB["recipes"].get(sec, []))
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        for it in items:
-            kb.add(types.InlineKeyboardButton(f"🗑 {it.get('title', 'Без названия')}", callback_data=f"r_del_ask:{sec}:{it['id']}"))
-        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"sec_open:{sec}"))
-        safe_edit_text(chat_id, msg_id, "Выберите карточку для удаления:", reply_markup=kb)
-    elif data.startswith("r_del_ask:"):
-        if not is_admin(uid):
-            return
-        _, sec, item_id = data.split(":", 2)
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("✅ Удалить", callback_data=f"r_del_yes:{sec}:{item_id}"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data=f"sec_open:{sec}"),
+    if text == BTN_HELP:
+        safe_send_text(
+            msg.chat.id,
+            "• Нажми <b>📥 Массовая загрузка</b> и отправь файлы PNG — бот запишет точное имя файла без расширения.\n"
+            "• Напиши название текстом — бот отправит название и прикреплённый файл/PNG.",
+            reply_markup=main_menu_keyboard(uid),
         )
-        safe_send_text(chat_id, "Подтвердить удаление?", reply_markup=kb)
-    elif data.startswith("r_del_yes:"):
-        if not is_admin(uid):
-            return
-        _, sec, item_id = data.split(":", 2)
+        return
+
+    if text == BTN_SUPPORT:
         with DATA_LOCK:
-            DB["recipes"][sec] = [x for x in DB["recipes"].get(sec, []) if x["id"] != item_id]
-            delete_recipe_remote(item_id)
-        safe_edit_text(chat_id, msg_id, "🗑 Удалено.", reply_markup=recipe_section_inline(sec, uid))
-    elif data.startswith("d_view:"):
-        item_id = data.split(":", 1)[1]
-        render_dishware_item(chat_id, uid, item_id, edit_msg_id=msg_id)
-    elif data == "d_add":
-        if not is_admin(uid):
-            return
-        set_state(uid, {"mode": "dishware_add", "step": "name", "data": {}, "return_section": "dishware"})
-        safe_send_text(chat_id, "Введите название посуды:", reply_markup=cancel_keyboard())
-    elif data.startswith("d_delta:"):
-        if not is_admin(uid):
-            return
-        _, item_id, delta_str = data.split(":", 2)
+            sup_text = str((DB.get("support") or {}).get("text") or "Обратитесь к администратору.")
+        safe_send_text(msg.chat.id, f"💬 <b>Поддержка:</b>\n{esc(sup_text)}", reply_markup=main_menu_keyboard(uid))
+        return
+
+    if text == BTN_RECIPES:
         with DATA_LOCK:
-            d = next((x for x in DB["dishware"] if x["id"] == item_id), None)
-            if d:
-                d["qty"] = int(d.get("qty", 0)) + int(delta_str)
-                persist_dishware(d)
-        render_dishware_item(chat_id, uid, item_id, edit_msg_id=msg_id)
-    elif data.startswith("d_set:"):
-        if not is_admin(uid):
+            recipes = list(DB.get("recipes", []))
+        if not recipes:
+            safe_send_text(msg.chat.id, "Рецептов пока нет.", reply_markup=main_menu_keyboard(uid))
             return
-        item_id = data.split(":", 1)[1]
-        set_state(uid, {"mode": "dishware_adjust", "step": "amount", "data": {"item_id": item_id}, "return_section": "dishware"})
-        safe_send_text(chat_id, "Введите новое число:", reply_markup=cancel_keyboard())
-    elif data.startswith("d_del_ask:"):
-        if not is_admin(uid):
-            return
-        item_id = data.split(":", 1)[1]
+        names = "\n".join(f"• {esc(r.get('name') or r.get('title') or 'Без названия')}" for r in recipes[:50])
+        safe_send_text(msg.chat.id, f"🍸 <b>Рецепты:</b>\n\n{names}", reply_markup=main_menu_keyboard(uid))
+        return
+
+    if text == BTN_DISHWARE:
         with DATA_LOCK:
-            DB["dishware"] = [x for x in DB["dishware"] if x["id"] != item_id]
-            delete_dishware_remote(item_id)
-        render_dishware_section(chat_id, uid, edit_msg_id=msg_id)
-    elif data == "sup_edit":
-        if not is_admin(uid):
+            dishware = list(DB.get("dishware", []))
+        if not dishware:
+            safe_send_text(msg.chat.id, "Посуды пока нет.", reply_markup=main_menu_keyboard(uid))
             return
-        set_state(uid, {"mode": "support_edit", "step": "text", "data": {}, "return_section": "support"})
-        safe_send_text(chat_id, "Введите новый текст поддержки:", reply_markup=cancel_keyboard())
+        lines = [f"• {esc(d.get('name') or '')}: {esc(d.get('qty') or 0)}" for d in dishware[:50]]
+        safe_send_text(msg.chat.id, f"🥃 <b>Посуда:</b>\n\n{lines}", reply_markup=main_menu_keyboard(uid))
+        return
+
+    # Текстовый поиск по сохранённым карточкам
+    print(f"[TEXT_SEARCH] uid={uid} query={text!r}", flush=True)
+    matches = find_media_matches(text)
+    if matches:
+        for card in matches[:5]:
+            safe_send_media_card(msg.chat.id, card, reply_markup=main_menu_keyboard(uid))
+        return
+
+    safe_send_text(msg.chat.id, f"Ничего не найдено по запросу «{esc(text)}».", reply_markup=main_menu_keyboard(uid))
 
 
-def run_bot():
-    start_health_server()
-    print(f"[NEW BUILD v10.3] Запуск бота (supabase: {sb_enabled()})...", flush=True)
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    time.sleep(3)
-    while True:
-        try:
-            bot.infinity_polling(
-                skip_pending=False,
-                timeout=25,
-                long_polling_timeout=25,
-                allowed_updates=["message", "callback_query"],
-            )
-        except Exception as e:
-            err_s = str(e)
-            if "409" in err_s:
-                print("[WARN] 409 Conflict, ждём 8 сек...", flush=True)
-                time.sleep(8)
-            else:
-                print(f"[ERROR] polling crashed: {e}", flush=True)
-                time.sleep(3)
+# =========================================================
+# HTTP HEALTH-CHECK ДЛЯ RENDER
+# =========================================================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_web_server() -> None:
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"[WEB] Listening on port {port}", flush=True)
+    server.serve_forever()
+
+
+# =========================================================
+# ТОЧКА ВХОДА
+# =========================================================
+def main() -> None:
+    print(f"[NEW BUILD v10.4] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
+    load_data()
+    threading.Thread(target=start_web_server, daemon=True).start()
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
 
 
 if __name__ == "__main__":
-    run_bot()
+    main()
