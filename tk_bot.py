@@ -38,6 +38,7 @@ DONATIONALERTS_URL = (
     os.getenv("DONATIONALERTS_URL") or "https://www.donationalerts.com/r/your_link"
 ).strip()
 MAX_BULK_FILES = int((os.getenv("MAX_BULK_FILES") or "30").strip())
+WATCHDOG_STALL_SEC = int((os.getenv("WATCHDOG_STALL_SEC") or "120").strip())
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
@@ -143,6 +144,9 @@ LAST_SEEN_SYNC: dict[int, float] = {}
 CALLBACK_CARD_MAP: dict[str, str] = {}
 SUGGESTIONS_STORE: dict[str, dict] = {}
 
+LAST_POLLING_HEARTBEAT = time.monotonic()
+POLLING_ACTIVE = False
+
 DB: dict = {
     "recipes": [],
     "dishware": [],
@@ -152,6 +156,28 @@ DB: dict = {
     "activity_logs": [],
     "media_cards": [],
 }
+
+
+def mark_polling_alive() -> None:
+    global LAST_POLLING_HEARTBEAT, POLLING_ACTIVE
+    LAST_POLLING_HEARTBEAT = time.monotonic()
+    POLLING_ACTIVE = True
+
+
+def trigger_self_restart(reason: str) -> None:
+    print(f"[WATCHDOG] Перезапуск процесса: {reason}", flush=True)
+    time.sleep(0.3)
+    os._exit(1)
+
+
+def polling_watchdog_loop() -> None:
+    while True:
+        time.sleep(15)
+        if not POLLING_ACTIVE:
+            continue
+        idle_for = time.monotonic() - LAST_POLLING_HEARTBEAT
+        if idle_for > WATCHDOG_STALL_SEC:
+            trigger_self_restart(f"polling не подавал признаков жизни {idle_for:.0f}с")
 
 
 # =========================================================
@@ -265,6 +291,7 @@ def get_admin_ids() -> list[int]:
 
 
 def safe_send_text(chat_id: int, text: str, reply_markup=None):
+    mark_polling_alive()
     try:
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
     except Exception as e:
@@ -722,6 +749,7 @@ def log_activity(user_id: int, username: str, action: str, details: str = "") ->
 
 
 def touch_user(msg: types.Message) -> None:
+    mark_polling_alive()
     user = msg.from_user
     if not user:
         return
@@ -732,6 +760,7 @@ def touch_user(msg: types.Message) -> None:
         existing = next((u for u in users if int(u.get("user_id") or 0) == uid), None)
         row = {
             "user_id": uid,
+            "uid": uid,
             "username": user.username or "",
             "is_admin": bool(existing.get("is_admin")) if existing else (uid == ADMIN_ID),
             "last_seen": now_str(),
@@ -847,6 +876,7 @@ def send_broadcast_to_all(announcement_text: str, admin_uid: int, admin_username
     payload = f"📢 <b>Обновление бота</b>\n\n{esc(announcement_text)}"
 
     for uid in recipients:
+        mark_polling_alive()
         try:
             res = bot.send_message(uid, payload)
             if res:
@@ -871,7 +901,7 @@ def _download_font_if_needed(target_path: str, urls: list[str]) -> str | None:
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = resp.read()
             if len(data) > 50000:
                 with open(target_path, "wb") as f:
@@ -1694,6 +1724,7 @@ def _build_photo_stream(card: dict):
 
 
 def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
+    mark_polling_alive()
     title_raw = clean_uploaded_title(str(card.get("title") or "")) or str(card.get("title") or "")
     caption = f"<b>{esc(title_raw)}</b>"
 
@@ -2142,6 +2173,7 @@ def finish_bulk_mode(msg: types.Message) -> None:
     )
 )
 def handle_ttk_callback(call: types.CallbackQuery):
+    mark_polling_alive()
     data = call.data or ""
     uid = call.from_user.id if call.from_user else 0
     username = (call.from_user.username or "") if call.from_user else ""
@@ -2972,8 +3004,10 @@ def handle_text(msg: types.Message):
 # =========================================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        mark_polling_alive()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(b"OK")
 
@@ -2989,17 +3023,35 @@ def start_web_server() -> None:
 
 
 # =========================================================
-# ТОЧКА ВХОДА
+# ТОЧКА ВХОДА С WATCHDOG АВТОПЕРЕЗАПУСКОМ
 # =========================================================
+def run_polling_supervisor() -> None:
+    while True:
+        mark_polling_alive()
+        try:
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=25,
+                long_polling_timeout=20,
+                logger_level=0,
+            )
+            mark_polling_alive()
+        except Exception as e:
+            print(f"[WARN] infinity_polling упал с ошибкой: {e}", flush=True)
+            mark_polling_alive()
+        time.sleep(2)
+
+
 def main() -> None:
     print(
-        f"[NEW BUILD v10.34] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.35] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
+    threading.Thread(target=polling_watchdog_loop, daemon=True).start()
+    run_polling_supervisor()
 
 
 if __name__ == "__main__":
