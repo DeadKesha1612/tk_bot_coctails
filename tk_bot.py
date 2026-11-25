@@ -54,12 +54,27 @@ BTN_REC_CLASSIC = "🥃 Классические"
 BTN_REC_INFUSIONS = "🫙 Наливки"
 BTN_REC_MENU = "🍹 Коктейли меню"
 BTN_MEDIA_LIST = "🖼 Карточки"
+BTN_MANAGE_TTK = "✏️ Ред. / Удалить ТТК"
 
 BTN_BULK_MEDIA = "📥 Массовая загрузка"
 BTN_DISH_SUMMARY = "📊 Подсчёт остатков"
 BTN_BACK = "⬅️ Назад"
 BTN_DONE = "✅ Готово"
 BTN_CANCEL = "❌ Отмена"
+
+BTN_TTK_RENAME = "📝 Переименовать"
+BTN_TTK_CAT = "🗂 Категория"
+BTN_TTK_REPLACE_FILE = "🔄 Заменить файл"
+BTN_TTK_DELETE = "🗑 Удалить ТТК"
+BTN_TTK_NEXT = "➡️ Дальше"
+BTN_TTK_PREV = "⬅️ Пред."
+
+TTK_CATEGORIES = [
+    "авторские",
+    "классические",
+    "наливки",
+    "коктейли меню",
+]
 
 INITIAL_DISHWARE = [
     ("Бокал Красный Винник", 24),
@@ -165,7 +180,7 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb.row(types.KeyboardButton(BTN_REC_INFUSIONS), types.KeyboardButton(BTN_REC_MENU))
     kb.row(types.KeyboardButton(BTN_MEDIA_LIST))
     if is_admin(user_id):
-        kb.row(types.KeyboardButton(BTN_BULK_MEDIA))
+        kb.row(types.KeyboardButton(BTN_MANAGE_TTK), types.KeyboardButton(BTN_BULK_MEDIA))
     kb.row(types.KeyboardButton(BTN_BACK))
     return kb
 
@@ -194,6 +209,35 @@ def dishware_item_keyboard() -> types.ReplyKeyboardMarkup:
     kb.row(types.KeyboardButton("+1"), types.KeyboardButton("-1"))
     kb.row(types.KeyboardButton("+5"), types.KeyboardButton("-5"))
     kb.row(types.KeyboardButton(BTN_DISH_SUMMARY), types.KeyboardButton(BTN_BACK))
+    return kb
+
+
+def ttk_list_keyboard(page: int, total_pages: int) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    nav = []
+    if page > 0:
+        nav.append(types.KeyboardButton(BTN_TTK_PREV))
+    if page + 1 < total_pages:
+        nav.append(types.KeyboardButton(BTN_TTK_NEXT))
+    if nav:
+        kb.row(*nav)
+    kb.row(types.KeyboardButton(BTN_BACK))
+    return kb
+
+
+def ttk_edit_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_TTK_RENAME), types.KeyboardButton(BTN_TTK_CAT))
+    kb.row(types.KeyboardButton(BTN_TTK_REPLACE_FILE), types.KeyboardButton(BTN_TTK_DELETE))
+    kb.row(types.KeyboardButton(BTN_BACK))
+    return kb
+
+
+def ttk_category_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("Авторские"), types.KeyboardButton("Классические"))
+    kb.row(types.KeyboardButton("Наливки"), types.KeyboardButton("Коктейли меню"))
+    kb.row(types.KeyboardButton("Без категории"), types.KeyboardButton(BTN_BACK))
     return kb
 
 
@@ -260,6 +304,10 @@ def sb_upsert(table: str, row: dict, on_conflict: str = "id"):
         payload=row,
         prefer="resolution=merge-duplicates,return=representation",
     )
+
+
+def sb_delete(table: str, query: str):
+    return sb_request("DELETE", table, query=query)
 
 
 def sync_local_from_memory() -> None:
@@ -470,7 +518,7 @@ def format_dishware_summary() -> str:
 
 
 # =========================================================
-# КАРТОЧКИ ФАЙЛОВ / PNG (tk_media_cards)
+# ТТК / КАРТОЧКИ (tk_media_cards)
 # =========================================================
 def persist_media_card(card: dict) -> None:
     sync_local_from_memory()
@@ -485,6 +533,91 @@ def persist_media_card(card: dict) -> None:
         },
         "id",
     )
+
+
+def delete_media_card_by_id(card_id: str, uid: int, username: str) -> dict | None:
+    with DATA_LOCK:
+        cards = DB.get("media_cards", [])
+        idx = next((i for i, c in enumerate(cards) if str(c.get("id")) == str(card_id)), None)
+        if idx is None:
+            return None
+        removed = cards.pop(idx)
+        sync_local_from_memory()
+
+    local_path = removed.get("photo_path")
+    if local_path and os.path.isfile(local_path):
+        try:
+            os.remove(local_path)
+        except Exception as e:
+            print(f"[WARN] remove local media file failed: {e}", flush=True)
+
+    sb_delete("tk_media_cards", f"id=eq.{urllib.parse.quote(str(card_id))}")
+    log_activity(uid, username, "TTK_DELETE", str(removed.get("title") or card_id))
+    return removed
+
+
+def update_media_card_title(card_id: str, new_title: str, uid: int, username: str) -> dict | None:
+    with DATA_LOCK:
+        cards = DB.get("media_cards", [])
+        card = next((c for c in cards if str(c.get("id")) == str(card_id)), None)
+        if not card:
+            return None
+        old_title = str(card.get("title") or "")
+        card["title"] = new_title
+        persist_media_card(card)
+
+    log_activity(uid, username, "TTK_RENAME", f"{old_title} -> {new_title}")
+    return card
+
+
+def update_media_card_category(card_id: str, new_category: str, uid: int, username: str) -> dict | None:
+    with DATA_LOCK:
+        cards = DB.get("media_cards", [])
+        card = next((c for c in cards if str(c.get("id")) == str(card_id)), None)
+        if not card:
+            return None
+        card["category"] = new_category
+        sync_local_from_memory()
+
+    log_activity(uid, username, "TTK_CAT", f"{card.get('title')} -> {new_category or 'без категории'}")
+    return card
+
+
+def replace_media_card_file(card_id: str, msg: types.Message, uid: int, username: str) -> tuple[bool, dict | str]:
+    file_id = None
+    ext = ".png"
+    if msg.content_type == "document" and msg.document:
+        file_id = msg.document.file_id
+        _, raw_ext = os.path.splitext(msg.document.file_name or "")
+        if raw_ext:
+            ext = raw_ext.lower()
+    elif msg.content_type == "photo" and msg.photo:
+        file_id = msg.photo[-1].file_id
+        ext = ".jpg"
+    else:
+        return False, "Отправьте новый файл (например, .png) или картинку."
+
+    local_path = os.path.join(MEDIA_DIR, f"{card_id}{ext}")
+    try:
+        file_info = bot.get_file(file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        with open(local_path, "wb") as out:
+            out.write(downloaded)
+    except Exception as e:
+        print(f"[WARN] replace download_file failed: {e}", flush=True)
+        local_path = None
+
+    with DATA_LOCK:
+        cards = DB.get("media_cards", [])
+        card = next((c for c in cards if str(c.get("id")) == str(card_id)), None)
+        if not card:
+            return False, "Карточка не найдена."
+        card["photo_file_id"] = file_id
+        card["photo_path"] = local_path
+        persist_media_card(card)
+
+    log_activity(uid, username, "TTK_REPLACE_FILE", str(card.get("title") or card_id))
+    return True, card
 
 
 def save_incoming_media_card(msg: types.Message, active_category: str = "") -> tuple[bool, dict | str]:
@@ -585,6 +718,56 @@ def find_media_matches(query: str) -> list[dict]:
     if exact:
         return exact
     return [c for c in cards if q in norm_text(c.get("title"))]
+
+
+def show_ttk_manage_page(msg: types.Message, page: int = 0) -> None:
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+        return
+    with DATA_LOCK:
+        cards = list(DB.get("media_cards", []))
+    if not cards:
+        safe_send_text(msg.chat.id, "ТТК (карточек) пока нет.", reply_markup=recipes_menu_keyboard(uid))
+        return
+
+    per_page = 10
+    total_pages = max(1, (len(cards) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * per_page
+    chunk = cards[start_idx : start_idx + per_page]
+
+    USER_STATES[uid] = {
+        "mode": "ttk_select",
+        "page": page,
+        "page_map": {str(start_idx + i + 1): c.get("id") for i, c in enumerate(chunk)},
+    }
+
+    lines = []
+    for i, c in enumerate(chunk, start=start_idx + 1):
+        cat = f" <i>[{esc(c.get('category'))}]</i>" if c.get("category") else ""
+        lines.append(f"<b>{i}.</b> {esc(c.get('title') or '')}{cat}")
+
+    safe_send_text(
+        msg.chat.id,
+        f"✏️ <b>Управление ТТК</b> (стр. {page + 1}/{total_pages}, всего {len(cards)}):\n\n"
+        + "\n".join(lines)
+        + "\n\nНапиши <b>номер</b> ТТК (или точное название) для редактирования или удаления.",
+        reply_markup=ttk_list_keyboard(page, total_pages),
+    )
+
+
+def open_ttk_card_actions(msg: types.Message, card: dict) -> None:
+    uid = msg.from_user.id
+    USER_STATES[uid] = {"mode": "ttk_card_actions", "card_id": card.get("id")}
+    cat_label = card.get("category") or "не задана"
+    safe_send_text(
+        msg.chat.id,
+        f"📄 <b>{esc(card.get('title') or '')}</b>\n"
+        f"Категория: <b>{esc(cat_label)}</b>\n\n"
+        "Выбери действие:",
+        reply_markup=ttk_edit_keyboard(),
+    )
 
 
 # =========================================================
@@ -755,9 +938,24 @@ def cmd_bulk(msg: types.Message):
 def handle_media_upload(msg: types.Message):
     touch_user(msg)
     uid = msg.from_user.id
+    username = msg.from_user.username or ""
     st = USER_STATES.get(uid) or {}
-    active_cat = str(st.get("category") or "")
 
+    if st.get("mode") == "ttk_wait_replace_file":
+        card_id = st.get("card_id")
+        ok, res = replace_media_card_file(card_id, msg, uid, username)
+        if not ok:
+            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=back_only_keyboard())
+            return
+        USER_STATES.pop(uid, None)
+        safe_send_text(
+            msg.chat.id,
+            f"✅ Файл обновлён для ТТК: <b>{esc(res.get('title') or '')}</b>",
+            reply_markup=recipes_menu_keyboard(uid),
+        )
+        return
+
+    active_cat = str(st.get("category") or "")
     ok, res = save_incoming_media_card(msg, active_category=active_cat)
     if not ok:
         safe_send_text(msg.chat.id, f"⚠️ {esc(res)}")
@@ -765,7 +963,7 @@ def handle_media_upload(msg: types.Message):
 
     card = res
     title = str(card.get("title") or "")
-    log_activity(uid, msg.from_user.username or "", "MEDIA_ADD", title)
+    log_activity(uid, username, "MEDIA_ADD", title)
 
     if st.get("mode") == "media_bulk_add":
         st["count"] = int(st.get("count") or 0) + 1
@@ -805,6 +1003,120 @@ def handle_text(msg: types.Message):
             "Сейчас активен режим массовой загрузки. Кидай файлы/PNG или нажми <b>✅ Готово</b>.",
             reply_markup=bulk_done_keyboard(),
         )
+        return
+
+    if st.get("mode") == "ttk_select":
+        page = int(st.get("page") or 0)
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
+            return
+        if text == BTN_TTK_NEXT:
+            show_ttk_manage_page(msg, page + 1)
+            return
+        if text == BTN_TTK_PREV:
+            show_ttk_manage_page(msg, page - 1)
+            return
+
+        page_map = st.get("page_map") or {}
+        card_id = page_map.get(text)
+        with DATA_LOCK:
+            cards = list(DB.get("media_cards", []))
+        target = next((c for c in cards if str(c.get("id")) == str(card_id)), None) if card_id else None
+        if not target:
+            target = next((c for c in cards if norm_text(c.get("title")) == low), None)
+        if target:
+            open_ttk_card_actions(msg, target)
+            return
+        safe_send_text(msg.chat.id, "Введи номер из списка или точное название ТТК, либо нажми <b>⬅️ Назад</b>.")
+        return
+
+    if st.get("mode") == "ttk_card_actions":
+        card_id = st.get("card_id")
+        with DATA_LOCK:
+            card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == str(card_id)), None)
+        if not card or text == BTN_BACK:
+            show_ttk_manage_page(msg, 0)
+            return
+
+        if text == BTN_TTK_RENAME:
+            USER_STATES[uid] = {"mode": "ttk_wait_rename", "card_id": card_id}
+            safe_send_text(
+                msg.chat.id,
+                f"Текущее название: <b>{esc(card.get('title') or '')}</b>\nВведи новое название ТТК:",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        if text == BTN_TTK_CAT:
+            USER_STATES[uid] = {"mode": "ttk_wait_cat", "card_id": card_id}
+            safe_send_text(
+                msg.chat.id,
+                f"Выбери категорию для <b>{esc(card.get('title') or '')}</b>:",
+                reply_markup=ttk_category_keyboard(),
+            )
+            return
+
+        if text == BTN_TTK_REPLACE_FILE:
+            USER_STATES[uid] = {"mode": "ttk_wait_replace_file", "card_id": card_id}
+            safe_send_text(
+                msg.chat.id,
+                f"Отправь новый файл (например, .png) или картинку для <b>{esc(card.get('title') or '')}</b>:",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+
+        if text == BTN_TTK_DELETE:
+            removed = delete_media_card_by_id(str(card_id), uid, username)
+            if removed:
+                safe_send_text(msg.chat.id, f"🗑 Удалено: <b>{esc(removed.get('title') or '')}</b>")
+            show_ttk_manage_page(msg, 0)
+            return
+
+    if st.get("mode") == "ttk_wait_rename":
+        card_id = st.get("card_id")
+        if text == BTN_BACK:
+            with DATA_LOCK:
+                card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == str(card_id)), None)
+            if card:
+                open_ttk_card_actions(msg, card)
+            else:
+                show_ttk_manage_page(msg, 0)
+            return
+        if not text:
+            safe_send_text(msg.chat.id, "Название не может быть пустым. Введи текст:")
+            return
+        updated = update_media_card_title(str(card_id), text, uid, username)
+        if updated:
+            safe_send_text(msg.chat.id, f"✅ Новое название: <b>{esc(updated.get('title') or '')}</b>")
+            open_ttk_card_actions(msg, updated)
+        else:
+            show_ttk_manage_page(msg, 0)
+        return
+
+    if st.get("mode") == "ttk_wait_cat":
+        card_id = st.get("card_id")
+        if text == BTN_BACK:
+            with DATA_LOCK:
+                card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == str(card_id)), None)
+            if card:
+                open_ttk_card_actions(msg, card)
+            else:
+                show_ttk_manage_page(msg, 0)
+            return
+        chosen_cat = "" if low == "без категории" else low
+        if chosen_cat and chosen_cat not in TTK_CATEGORIES:
+            safe_send_text(msg.chat.id, "Выбери категорию на клавиатуре ниже:", reply_markup=ttk_category_keyboard())
+            return
+        updated = update_media_card_category(str(card_id), chosen_cat, uid, username)
+        if updated:
+            safe_send_text(
+                msg.chat.id,
+                f"✅ Категория обновлена: <b>{esc(chosen_cat or 'без категории')}</b>",
+            )
+            open_ttk_card_actions(msg, updated)
+        else:
+            show_ttk_manage_page(msg, 0)
         return
 
     if st.get("mode") == "help_wait_text":
@@ -862,6 +1174,10 @@ def handle_text(msg: types.Message):
     if text == BTN_BACK:
         USER_STATES.pop(uid, None)
         safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+        return
+
+    if text == BTN_MANAGE_TTK:
+        show_ttk_manage_page(msg, 0)
         return
 
     if text == BTN_BULK_MEDIA:
@@ -965,7 +1281,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.7] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
+    print(f"[NEW BUILD v10.8] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
