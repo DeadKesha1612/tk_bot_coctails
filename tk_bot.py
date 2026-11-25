@@ -69,6 +69,7 @@ BTN_REC_AUTHOR = "✨ Авторские"
 BTN_REC_CLASSIC = "🥃 Классические"
 BTN_REC_INFUSIONS = "🫙 Наливки"
 BTN_REC_MENU = "🍹 Коктейли меню"
+BTN_REC_PREMIXES = "🧪 Премиксы"
 BTN_MEDIA_LIST = "🖼 Карточки"
 BTN_ADD_TTK_TEXT = "➕ Добавить ТТК текстом"
 BTN_MANAGE_TTK = "✏️ Ред. / Удалить ТТК"
@@ -98,6 +99,7 @@ CAT_CODES = {
     "классические": "classic",
     "наливки": "infusions",
     "коктейли меню": "menu",
+    "премиксы": "premixes",
 }
 CODE_TO_CAT = {v: k for k, v in CAT_CODES.items()}
 
@@ -106,6 +108,7 @@ TTK_CATEGORIES = [
     "классические",
     "наливки",
     "коктейли меню",
+    "премиксы",
 ]
 
 INITIAL_DISHWARE = [
@@ -164,7 +167,7 @@ def clean_uploaded_title(raw_title: str | None) -> str:
     s = (raw_title or "").strip()
     if not s:
         return ""
-    s = re.sub(r"^(?:page[\s_]+)?(?:tk|тк)[\s_]+(?:tk|тк)?[\s_]*(?:коктейль|напиток)?[\s_]*", "", s, flags=re.I)
+    s = re.sub(r"^(?:page[\s_]+)?(?:tk|тк)[\s_]+(?:tk|тк)?[\s_]*(?:коктейль|напиток|премикс)?[\s_]*", "", s, flags=re.I)
     s = re.sub(r"(?:[_\s]+№[_\s]*\d+)?(?:[_\s]+c[_\s]+\d{1,2}[_\s.]\d{1,2}[_\s.]\d{2,4}).*$", "", s, flags=re.I)
     s = re.sub(r"[_\s]+№[_\s]*\d+.*$", "", s, flags=re.I)
     s = re.sub(r"[^0-9A-Za-zА-Яа-яЁё()\s]+", " ", s)
@@ -262,7 +265,8 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton(BTN_REC_AUTHOR), types.KeyboardButton(BTN_REC_CLASSIC))
     kb.row(types.KeyboardButton(BTN_REC_INFUSIONS), types.KeyboardButton(BTN_REC_MENU))
-    kb.row(types.KeyboardButton(BTN_MEDIA_LIST), types.KeyboardButton(BTN_ADD_TTK_TEXT))
+    kb.row(types.KeyboardButton(BTN_REC_PREMIXES), types.KeyboardButton(BTN_MEDIA_LIST))
+    kb.row(types.KeyboardButton(BTN_ADD_TTK_TEXT))
     if is_admin(user_id):
         kb.row(types.KeyboardButton(BTN_MANAGE_TTK), types.KeyboardButton(BTN_BULK_MEDIA))
         kb.row(types.KeyboardButton(BTN_CLEAN_TITLES))
@@ -274,8 +278,8 @@ def manage_tab_keyboard() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton("Авторские"), types.KeyboardButton("Классические"))
     kb.row(types.KeyboardButton("Наливки"), types.KeyboardButton("Коктейли меню"))
-    kb.row(types.KeyboardButton("Без категории"), types.KeyboardButton("Все карточки"))
-    kb.row(types.KeyboardButton(BTN_BACK))
+    kb.row(types.KeyboardButton("Премиксы"), types.KeyboardButton("Без категории"))
+    kb.row(types.KeyboardButton("Все карточки"), types.KeyboardButton(BTN_BACK))
     return kb
 
 
@@ -366,7 +370,8 @@ def ttk_category_keyboard() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton("Авторские"), types.KeyboardButton("Классические"))
     kb.row(types.KeyboardButton("Наливки"), types.KeyboardButton("Коктейли меню"))
-    kb.row(types.KeyboardButton("Без категории"), types.KeyboardButton(BTN_BACK))
+    kb.row(types.KeyboardButton("Премиксы"), types.KeyboardButton("Без категории"))
+    kb.row(types.KeyboardButton(BTN_BACK))
     return kb
 
 
@@ -891,7 +896,6 @@ def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
     if not text:
         return []
 
-    # Явные разделители блоков: ---, ===, ***
     explicit_chunks = re.split(r"(?m)^\s*(?:-{3,}|={3,}|\*{3,})\s*$", text)
     blocks: list[str] = []
 
@@ -899,9 +903,6 @@ def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
         clean_chunk = chunk.strip()
         if not clean_chunk:
             continue
-        # Если внутри чанка несколько параграфов через пустую строку,
-        # объединяем строки состава/приготовления к текущему коктейлю,
-        # а новый параграф с коротким названием + телом начинаем как отдельный коктейль.
         paras = [p.strip() for p in re.split(r"\n\s*\n+", clean_chunk) if p.strip()]
         if len(paras) <= 1:
             blocks.append(clean_chunk)
@@ -911,13 +912,13 @@ def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
         for p in paras:
             p_lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
             first_line = p_lines[0] if p_lines else ""
-            is_new_cocktail_header = (
+            is_new_item_header = (
                 len(p_lines) >= 2
                 and len(first_line) <= 65
                 and not re.match(r"^(?:приготовление|способ приготовления|метод|описание|состав|ингредиенты)\b", first_line, flags=re.I)
                 and not re.search(r"\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)\b", first_line, flags=re.I)
             )
-            if current_lines and is_new_cocktail_header:
+            if current_lines and is_new_item_header:
                 blocks.append("\n".join(current_lines))
                 current_lines = list(p_lines)
             else:
@@ -1103,9 +1104,8 @@ def create_single_ttk_block(block_text: str, category: str, uid: int, username: 
         body = "\n".join(lines[1:])
 
     if not title:
-        return False, "Не удалось определить название коктейля."
+        return False, "Не удалось определить название ТТК."
 
-    # Уникальный ID для каждой отдельной карточки/фото
     card_id = f"media_{uuid.uuid4().hex[:10]}"
     png_bytes = render_ttk_png_bytes(title, body, category=category)
     local_path, storage_path = (
@@ -1301,7 +1301,7 @@ def replace_media_card_file(card_id: str, msg: types.Message, uid: int, username
 def save_incoming_media_card(msg: types.Message, active_category: str = "") -> tuple[bool, dict | str]:
     exact_title = exact_title_from_message(msg)
     if not exact_title:
-        return False, "Не удалось определить название коктейля — отправьте файл с названием или добавьте подпись."
+        return False, "Не удалось определить название ТТК — отправьте файл с названием или добавьте подпись."
 
     file_id = None
     ext = ".png"
@@ -1562,7 +1562,7 @@ def _build_popup_page_payload(cards: list[dict], header_title: str, page: int, c
     chunk = cards[start_idx : start_idx + per_page]
 
     page_note = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
-    text = f"<b>{esc(header_title)}</b>{esc(page_note)} — выбери коктейль из списка:"
+    text = f"<b>{esc(header_title)}</b>{esc(page_note)} — выбери позицию из списка:"
     kb = ttk_popup_keyboard(chunk, page, total_pages, category_key)
     return text, kb
 
@@ -1852,6 +1852,7 @@ def handle_ttk_callback(call: types.CallbackQuery):
             "классические": BTN_REC_CLASSIC,
             "наливки": BTN_REC_INFUSIONS,
             "коктейли меню": BTN_REC_MENU,
+            "премиксы": BTN_REC_PREMIXES,
             "": BTN_MEDIA_LIST,
         }
         header_title = header_map.get(cat_key, cat_key or BTN_MEDIA_LIST)
@@ -2011,8 +2012,8 @@ def handle_text(msg: types.Message):
         safe_send_text(
             msg.chat.id,
             f"Категория: <b>{esc(chosen_cat or 'без категории')}</b>.\n\n"
-            "Напиши ТТК текстом (можно сразу несколько коктейлей через <code>---</code> или пустую строку):\n"
-            "• 1-я строка блока — <b>название коктейля</b>\n"
+            "Напиши ТТК текстом (можно сразу несколько позиций через <code>---</code> или пустую строку):\n"
+            "• 1-я строка блока — <b>название</b>\n"
             "• Строки с количеством — в таблицу <b>СОСТАВ</b> (например, <code>Джин 40 мл</code>)\n"
             "• Строка с описанием приготовления — в блок <b>ПРИГОТОВЛЕНИЕ</b> "
             "(например, <code>Приготовление: смешать со льдом и процедить</code>)",
@@ -2364,7 +2365,7 @@ def handle_text(msg: types.Message):
         safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
         return
 
-    if text in (BTN_REC_AUTHOR, BTN_REC_CLASSIC, BTN_REC_INFUSIONS, BTN_REC_MENU):
+    if text in (BTN_REC_AUTHOR, BTN_REC_CLASSIC, BTN_REC_INFUSIONS, BTN_REC_MENU, BTN_REC_PREMIXES):
         log_activity(uid, username, "RECIPES_CAT", text)
         show_recipe_category(msg, text, page=0)
         return
@@ -2455,7 +2456,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.29] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.30] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
