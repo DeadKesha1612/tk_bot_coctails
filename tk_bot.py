@@ -83,8 +83,17 @@ BTN_TTK_DELETE = "🗑 Удалить ТТК"
 BTN_TTK_NEXT = "➡️ Дальше"
 BTN_TTK_PREV = "⬅️ Пред."
 
-CB_CARD_PREFIX = "ttk_open:"
-CB_PAGE_PREFIX = "ttk_page:"
+CB_CARD_PREFIX = "c:"
+CB_PAGE_PREFIX = "p:"
+
+CAT_CODES = {
+    "": "all",
+    "авторские": "author",
+    "классические": "classic",
+    "наливки": "infusions",
+    "коктейли меню": "menu",
+}
+CODE_TO_CAT = {v: k for k, v in CAT_CODES.items()}
 
 TTK_CATEGORIES = [
     "авторские",
@@ -112,6 +121,7 @@ INITIAL_DISHWARE = [
 DATA_LOCK = threading.RLock()
 USER_STATES: dict[int, dict] = {}
 LAST_SEEN_SYNC: dict[int, float] = {}
+CALLBACK_CARD_MAP: dict[str, str] = {}
 
 DB: dict = {
     "recipes": [],
@@ -255,22 +265,30 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     return kb
 
 
+def _register_card_callback_key(card_id: str) -> str:
+    short_key = re.sub(r"[^0-9A-Za-z_-]", "", str(card_id))[-24:] or uuid.uuid4().hex[:10]
+    CALLBACK_CARD_MAP[short_key] = str(card_id)
+    return short_key
+
+
 def ttk_popup_keyboard(page_cards: list[dict], page: int, total_pages: int, cat_key: str) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     for card in page_cards:
         cid = str(card.get("id") or "")
+        short_key = _register_card_callback_key(cid)
         title = str(card.get("title") or "Без названия")[:64]
-        kb.add(types.InlineKeyboardButton(text=title, callback_data=f"{CB_CARD_PREFIX}{cid}"))
+        kb.add(types.InlineKeyboardButton(text=title, callback_data=f"{CB_CARD_PREFIX}{short_key}"))
 
     nav_buttons = []
     if total_pages > 1:
+        cat_code = CAT_CODES.get(cat_key, "all")
         prev_page = page - 1 if page > 0 else total_pages - 1
         next_page = page + 1 if page + 1 < total_pages else 0
         nav_buttons.append(
-            types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{CB_PAGE_PREFIX}{prev_page}:{cat_key}")
+            types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{CB_PAGE_PREFIX}{prev_page}:{cat_code}")
         )
         nav_buttons.append(
-            types.InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"{CB_PAGE_PREFIX}{next_page}:{cat_key}")
+            types.InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"{CB_PAGE_PREFIX}{next_page}:{cat_code}")
         )
         kb.row(*nav_buttons)
     return kb
@@ -1026,7 +1044,7 @@ def replace_media_card_file(card_id: str, msg: types.Message, uid: int, username
         card = next((c for c in cards if str(c.get("id")) == str(card_id)), None)
         if not card:
             return False, "Карточка не найдена."
-        card["photo_file_id"] = None
+        card["photo_file_id"] = file_id
         card["photo_path"] = local_path
         persist_media_card(card)
 
@@ -1070,7 +1088,7 @@ def save_incoming_media_card(msg: types.Message, active_category: str = "") -> t
         "id": card_id,
         "title": exact_title,
         "category": active_category,
-        "photo_file_id": None if msg.content_type == "document" else file_id,
+        "photo_file_id": file_id,
         "photo_path": local_path,
         "created_at": now_str(),
     }
@@ -1093,31 +1111,50 @@ def save_incoming_media_card(msg: types.Message, active_category: str = "") -> t
     return True, card
 
 
-def _build_photo_stream(photo_path: str | None, file_id: str | None):
+def _bytes_to_jpeg_stream(raw_bytes: bytes) -> io.BytesIO:
+    if PIL_AVAILABLE:
+        try:
+            with Image.open(io.BytesIO(raw_bytes)) as im:
+                rgb = im.convert("RGB")
+                buf = io.BytesIO()
+                buf.name = "card.jpg"
+                rgb.save(buf, format="JPEG", quality=92)
+                buf.seek(0)
+                return buf
+        except Exception as e:
+            print(f"[WARN] Pillow convert bytes failed: {e}", flush=True)
+    buf = io.BytesIO(raw_bytes)
+    buf.name = "card.png"
+    buf.seek(0)
+    return buf
+
+
+def _build_photo_stream(card: dict):
+    photo_path = card.get("photo_path")
+    file_id = card.get("photo_file_id")
+
     if photo_path and os.path.isfile(photo_path):
-        if PIL_AVAILABLE:
-            try:
-                with Image.open(photo_path) as im:
-                    rgb = im.convert("RGB")
-                    buf = io.BytesIO()
-                    buf.name = "card.jpg"
-                    rgb.save(buf, format="JPEG", quality=92)
-                    buf.seek(0)
-                    return buf
-            except Exception as e:
-                print(f"[WARN] Pillow convert to JPEG failed ({photo_path}): {e}", flush=True)
         try:
             with open(photo_path, "rb") as f:
-                data = f.read()
-            buf = io.BytesIO(data)
-            buf.name = os.path.basename(photo_path) or "card.png"
-            buf.seek(0)
-            return buf
+                return _bytes_to_jpeg_stream(f.read())
         except Exception as e:
             print(f"[WARN] read photo_path failed ({photo_path}): {e}", flush=True)
 
     if file_id:
-        return file_id
+        try:
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            if downloaded:
+                if photo_path:
+                    try:
+                        os.makedirs(os.path.dirname(photo_path), exist_ok=True)
+                        with open(photo_path, "wb") as out:
+                            out.write(downloaded)
+                    except Exception:
+                        pass
+                return _bytes_to_jpeg_stream(downloaded)
+        except Exception as e:
+            print(f"[WARN] download by photo_file_id failed ({file_id}): {e}", flush=True)
 
     return None
 
@@ -1125,23 +1162,26 @@ def _build_photo_stream(photo_path: str | None, file_id: str | None):
 def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
     title_raw = clean_uploaded_title(str(card.get("title") or "")) or str(card.get("title") or "")
     caption = f"<b>{esc(title_raw)}</b>"
-    file_id = card.get("photo_file_id")
-    photo_path = card.get("photo_path")
 
-    photo_payload = _build_photo_stream(photo_path, file_id)
+    photo_payload = _build_photo_stream(card)
     if photo_payload is not None:
         try:
             sent = bot.send_photo(chat_id, photo_payload, caption=caption, reply_markup=reply_markup)
-            if sent and sent.photo and not file_id:
+            if sent and sent.photo:
                 new_fid = sent.photo[-1].file_id
-                with DATA_LOCK:
-                    card["photo_file_id"] = new_fid
-                    persist_media_card(card)
+                if new_fid and new_fid != card.get("photo_file_id"):
+                    with DATA_LOCK:
+                        card["photo_file_id"] = new_fid
+                        persist_media_card(card)
             return
         except Exception as e:
             print(f"[WARN] send_photo failed ({title_raw}): {e}", flush=True)
 
-    safe_send_text(chat_id, caption, reply_markup=reply_markup)
+    safe_send_text(
+        chat_id,
+        f"{caption}\n<i>⚠️ Фото недоступно на сервере (файл не найден). Загрузи карточку заново.</i>",
+        reply_markup=reply_markup,
+    )
 
 
 def find_media_matches(query: str) -> list[dict]:
@@ -1439,9 +1479,13 @@ def handle_ttk_callback(call: types.CallbackQuery):
     username = (call.from_user.username or "") if call.from_user else ""
 
     if data.startswith(CB_CARD_PREFIX):
-        card_id = data[len(CB_CARD_PREFIX) :]
+        short_key = data[len(CB_CARD_PREFIX) :]
+        card_id = CALLBACK_CARD_MAP.get(short_key) or short_key
         with DATA_LOCK:
-            card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == card_id), None)
+            cards = list(DB.get("media_cards", []))
+            card = next((c for c in cards if str(c.get("id")) == card_id), None)
+            if not card:
+                card = next((c for c in cards if str(c.get("id")).endswith(short_key)), None)
         try:
             bot.answer_callback_query(call.id)
         except Exception:
@@ -1457,8 +1501,9 @@ def handle_ttk_callback(call: types.CallbackQuery):
 
     if data.startswith(CB_PAGE_PREFIX):
         rest = data[len(CB_PAGE_PREFIX) :]
-        page_str, cat_key = (rest.split(":", 1) + [""])[:2]
+        page_str, cat_code = (rest.split(":", 1) + ["all"])[:2]
         page = int(page_str) if page_str.isdigit() else 0
+        cat_key = CODE_TO_CAT.get(cat_code, "")
         cards = _get_filtered_cards(cat_key)
         header_map = {
             "авторские": BTN_REC_AUTHOR,
@@ -1965,7 +2010,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.19] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.20] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
