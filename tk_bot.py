@@ -537,6 +537,33 @@ def sb_delete(table: str, query: str):
     return sb_request("DELETE", table, query=query)
 
 
+def _extract_support_url(row: dict | None) -> str:
+    if isinstance(row, dict):
+        for key in ("text", "url", "link", "value"):
+            val = str(row.get(key) or "").strip()
+            if val.startswith(("http://", "https://")):
+                return val
+    return DONATIONALERTS_URL
+
+
+def save_support_url(new_url: str, uid: int, username: str) -> tuple[bool, str]:
+    cleaned = (new_url or "").strip()
+    if not cleaned.startswith(("http://", "https://")):
+        return False, "Ссылка должна начинаться с https:// или http://"
+
+    with DATA_LOCK:
+        DB["support"] = {"id": "main", "text": cleaned}
+        sync_local_from_memory()
+
+    if SUPABASE_ENABLED:
+        res = sb_upsert("tk_support", {"id": "main", "text": cleaned}, "id")
+        if res is None:
+            sb_upsert("tk_support", {"id": "main", "url": cleaned}, "id")
+
+    log_activity(uid, username, "SET_SUPPORT_URL", cleaned)
+    return True, cleaned
+
+
 def _storage_object_path(card_id: str, ext: str = ".png") -> str:
     clean_ext = ext if ext.startswith(".") else f".{ext}"
     clean_ext = re.sub(r"[^0-9A-Za-z.]", "", clean_ext)[:8] or ".png"
@@ -691,7 +718,11 @@ def load_data() -> None:
 
         support_rows = sb_select("tk_support", "id=eq.main&limit=1")
         if support_rows:
-            data["support"] = support_rows[0]
+            extracted = _extract_support_url(support_rows[0])
+            data["support"] = {"id": "main", "text": extracted}
+        else:
+            current_sup = _extract_support_url(data.get("support"))
+            data["support"] = {"id": "main", "text": current_sup}
 
         activity_logs = sb_select("tk_activity_logs", "limit=800")
         if activity_logs is not None:
@@ -2096,8 +2127,7 @@ def send_support_link(msg: types.Message) -> None:
     uid = msg.from_user.id
     uname = msg.from_user.username or ""
     with DATA_LOCK:
-        sup_raw = str((DB.get("support") or {}).get("text") or "").strip()
-    url = sup_raw if sup_raw.startswith(("http://", "https://")) else DONATIONALERTS_URL
+        url = _extract_support_url(DB.get("support"))
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("💛 Поддержать на DonationAlerts", url=url))
     safe_send_text(
@@ -2343,6 +2373,38 @@ def cmd_broadcast(msg: types.Message):
     )
 
 
+@bot.message_handler(commands=["set_support"])
+def cmd_set_support(msg: types.Message):
+    touch_user(msg)
+    if not require_admin_msg(msg):
+        return
+    uid = msg.from_user.id
+    uname = msg.from_user.username or ""
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        ok, res = save_support_url(parts[1].strip(), uid, uname)
+        if not ok:
+            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=main_menu_keyboard(uid, uname))
+            return
+        safe_send_text(
+            msg.chat.id,
+            f"✅ Ссылка на DonationAlerts обновлена:\n{esc(res)}",
+            reply_markup=main_menu_keyboard(uid, uname),
+        )
+        return
+
+    USER_STATES[uid] = {"mode": "admin_set_support"}
+    with DATA_LOCK:
+        cur_url = _extract_support_url(DB.get("support"))
+    safe_send_text(
+        msg.chat.id,
+        f"💛 Текущая ссылка поддержки:\n{esc(cur_url)}\n\n"
+        "Отправь следующим сообщением новую ссылку на DonationAlerts (например, <code>https://www.donationalerts.com/r/твой_ник</code>) "
+        "или нажми <b>⬅️ Назад</b>.",
+        reply_markup=back_only_keyboard(),
+    )
+
+
 @bot.message_handler(content_types=["document", "photo"])
 def handle_media_upload(msg: types.Message):
     touch_user(msg)
@@ -2416,6 +2478,26 @@ def handle_text(msg: types.Message):
     text = (msg.text or "").strip()
     low = norm_text(text)
     st = USER_STATES.get(uid) or {}
+
+    if st.get("mode") == "admin_set_support":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "Изменение отменено. Главное меню:", reply_markup=main_menu_keyboard(uid, username))
+            return
+        ok, res = save_support_url(text, uid, username)
+        if not ok:
+            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=back_only_keyboard())
+            return
+        USER_STATES.pop(uid, None)
+        safe_send_text(
+            msg.chat.id,
+            f"✅ Ссылка на DonationAlerts обновлена:\n{esc(res)}",
+            reply_markup=main_menu_keyboard(uid, username),
+        )
+        return
 
     if st.get("mode") == "admin_broadcast":
         if not require_admin_msg(msg):
@@ -3044,7 +3126,7 @@ def run_polling_supervisor() -> None:
 
 def main() -> None:
     print(
-        f"[NEW BUILD v10.35] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.36] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
