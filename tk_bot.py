@@ -38,7 +38,7 @@ DONATIONALERTS_URL = (
     os.getenv("DONATIONALERTS_URL") or "https://www.donationalerts.com/r/your_link"
 ).strip()
 MAX_BULK_FILES = int((os.getenv("MAX_BULK_FILES") or "30").strip())
-WATCHDOG_STALL_SEC = int((os.getenv("WATCHDOG_STALL_SEC") or "120").strip())
+WATCHDOG_STALL_SEC = int((os.getenv("WATCHDOG_STALL_SEC") or "180").strip())
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
@@ -172,7 +172,7 @@ def trigger_self_restart(reason: str) -> None:
 
 def polling_watchdog_loop() -> None:
     while True:
-        time.sleep(15)
+        time.sleep(20)
         if not POLLING_ACTIVE:
             continue
         idle_for = time.monotonic() - LAST_POLLING_HEARTBEAT
@@ -484,6 +484,7 @@ def bulk_done_keyboard() -> types.ReplyKeyboardMarkup:
 # SUPABASE REST API + STORAGE + ЛОКАЛЬНЫЙ СНИМОК
 # =========================================================
 def sb_request(method: str, table: str, query: str = "", payload=None, prefer: str = ""):
+    mark_polling_alive()
     if not SUPABASE_ENABLED:
         return None
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -504,7 +505,7 @@ def sb_request(method: str, table: str, query: str = "", payload=None, prefer: s
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=7) as resp:
             raw = resp.read().decode("utf-8", errors="replace").strip()
             if not raw:
                 return []
@@ -580,6 +581,7 @@ def _content_type_for_ext(ext: str) -> str:
 
 
 def storage_upload_bytes(object_path: str, raw_bytes: bytes, content_type: str = "image/png") -> str | None:
+    mark_polling_alive()
     if not SUPABASE_STORAGE_ENABLED or not raw_bytes:
         return None
     encoded_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
@@ -592,7 +594,7 @@ def storage_upload_bytes(object_path: str, raw_bytes: bytes, content_type: str =
     }
     req = urllib.request.Request(url, data=raw_bytes, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             if 200 <= resp.status < 300:
                 return object_path
     except urllib.error.HTTPError as e:
@@ -604,6 +606,7 @@ def storage_upload_bytes(object_path: str, raw_bytes: bytes, content_type: str =
 
 
 def storage_download_bytes(object_path: str) -> bytes | None:
+    mark_polling_alive()
     if not SUPABASE_STORAGE_ENABLED or not object_path:
         return None
     encoded_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
@@ -618,7 +621,7 @@ def storage_download_bytes(object_path: str) -> bytes | None:
         }
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = resp.read()
                 if data:
                     return data
@@ -628,6 +631,7 @@ def storage_download_bytes(object_path: str) -> bytes | None:
 
 
 def storage_delete_object(object_path: str) -> None:
+    mark_polling_alive()
     if not SUPABASE_STORAGE_ENABLED or not object_path:
         return
     encoded_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
@@ -638,7 +642,7 @@ def storage_delete_object(object_path: str) -> None:
     }
     req = urllib.request.Request(url, headers=headers, method="DELETE")
     try:
-        with urllib.request.urlopen(req, timeout=15):
+        with urllib.request.urlopen(req, timeout=7):
             pass
     except Exception as e:
         print(f"[WARN] Supabase Storage delete failed ({object_path}): {e}", flush=True)
@@ -690,63 +694,75 @@ def load_local_fallback() -> dict:
 
 
 def load_data() -> None:
+    mark_polling_alive()
     with DATA_LOCK:
         data = load_local_fallback()
-        local_cat_by_id = {
-            str(c.get("id")): str(c.get("category") or "")
-            for c in data.get("media_cards", [])
-            if c.get("id")
-        }
+        DB.clear()
+        DB.update(data)
 
-        recipes = sb_select("tk_recipes", "order=created_at.asc")
-        if recipes is not None:
-            data["recipes"] = recipes
+    if not SUPABASE_ENABLED:
+        with DATA_LOCK:
+            seed_default_dishware_if_empty(DB)
+            sync_local_from_memory()
+        return
 
-        dishware = sb_select("tk_dishware", "order=id.asc")
-        if dishware is not None:
-            data["dishware"] = dishware
+    local_cat_by_id = {
+        str(c.get("id")): str(c.get("category") or "")
+        for c in data.get("media_cards", [])
+        if c.get("id")
+    }
 
-        seed_default_dishware_if_empty(data)
+    recipes = sb_select("tk_recipes", "order=created_at.asc")
+    if recipes is not None:
+        data["recipes"] = recipes
 
-        dishware_logs = sb_select("tk_dishware_logs", "order=id.desc&limit=500")
-        if dishware_logs is not None:
-            data["dishware_logs"] = dishware_logs
+    dishware = sb_select("tk_dishware", "order=id.asc")
+    if dishware is not None:
+        data["dishware"] = dishware
 
-        users = sb_select("tk_users", "limit=200")
-        if users is not None:
-            data["users"] = users
+    seed_default_dishware_if_empty(data)
 
-        support_rows = sb_select("tk_support", "id=eq.main&limit=1")
-        if support_rows:
-            extracted = _extract_support_url(support_rows[0])
-            data["support"] = {"id": "main", "text": extracted}
-        else:
-            current_sup = _extract_support_url(data.get("support"))
-            data["support"] = {"id": "main", "text": current_sup}
+    dishware_logs = sb_select("tk_dishware_logs", "order=id.desc&limit=500")
+    if dishware_logs is not None:
+        data["dishware_logs"] = dishware_logs
 
-        activity_logs = sb_select("tk_activity_logs", "limit=800")
-        if activity_logs is not None:
-            data["activity_logs"] = activity_logs
+    users = sb_select("tk_users", "limit=200")
+    if users is not None:
+        data["users"] = users
 
-        media_rows = sb_select("tk_media_cards", "order=created_at.asc")
-        if media_rows is not None:
-            data["media_cards"] = [
-                {
-                    "id": str(m.get("id")),
-                    "title": str(m.get("title") or ""),
-                    "category": str(m.get("category") or local_cat_by_id.get(str(m.get("id"))) or ""),
-                    "photo_file_id": m.get("photo_file_id"),
-                    "photo_path": m.get("photo_path"),
-                    "storage_path": m.get("storage_path"),
-                    "created_at": str(m.get("created_at") or now_str()),
-                }
-                for m in media_rows
-            ]
-        data.setdefault("media_cards", [])
+    support_rows = sb_select("tk_support", "id=eq.main&limit=1")
+    if support_rows:
+        extracted = _extract_support_url(support_rows[0])
+        data["support"] = {"id": "main", "text": extracted}
+    else:
+        current_sup = _extract_support_url(data.get("support"))
+        data["support"] = {"id": "main", "text": current_sup}
 
+    activity_logs = sb_select("tk_activity_logs", "limit=800")
+    if activity_logs is not None:
+        data["activity_logs"] = activity_logs
+
+    media_rows = sb_select("tk_media_cards", "order=created_at.asc")
+    if media_rows is not None:
+        data["media_cards"] = [
+            {
+                "id": str(m.get("id")),
+                "title": str(m.get("title") or ""),
+                "category": str(m.get("category") or local_cat_by_id.get(str(m.get("id"))) or ""),
+                "photo_file_id": m.get("photo_file_id"),
+                "photo_path": m.get("photo_path"),
+                "storage_path": m.get("storage_path"),
+                "created_at": str(m.get("created_at") or now_str()),
+            }
+            for m in media_rows
+        ]
+    data.setdefault("media_cards", [])
+
+    with DATA_LOCK:
         DB.clear()
         DB.update(data)
         sync_local_from_memory()
+    mark_polling_alive()
 
 
 def log_activity(user_id: int, username: str, action: str, details: str = "") -> None:
@@ -930,9 +946,10 @@ def _download_font_if_needed(target_path: str, urls: list[str]) -> str | None:
     if os.path.isfile(target_path) and os.path.getsize(target_path) > 10000:
         return target_path
     for url in urls:
+        mark_polling_alive()
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = resp.read()
             if len(data) > 50000:
                 with open(target_path, "wb") as f:
@@ -3113,8 +3130,8 @@ def run_polling_supervisor() -> None:
         try:
             bot.infinity_polling(
                 skip_pending=True,
-                timeout=25,
-                long_polling_timeout=20,
+                timeout=15,
+                long_polling_timeout=15,
                 logger_level=0,
             )
             mark_polling_alive()
@@ -3126,13 +3143,17 @@ def run_polling_supervisor() -> None:
 
 def main() -> None:
     print(
-        f"[NEW BUILD v10.36] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.37] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
-    load_data()
+    with DATA_LOCK:
+        DB.clear()
+        DB.update(load_local_fallback())
+
     threading.Thread(target=start_web_server, daemon=True).start()
     threading.Thread(target=polling_watchdog_loop, daemon=True).start()
+    threading.Thread(target=load_data, daemon=True).start()
     run_polling_supervisor()
 
 
