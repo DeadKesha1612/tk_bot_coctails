@@ -44,6 +44,7 @@ SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "user_media")
+FONT_CACHE_PATH = os.path.join(DATA_DIR, "DejaVuSans.ttf")
 LOCAL_DB_FILE = os.path.join(DATA_DIR, "tk_bot_state.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -558,8 +559,55 @@ def format_dishware_summary() -> str:
 
 
 # =========================================================
-# ТТК / КАРТОЧКИ + РЕНДЕР ИЗ ТЕКСТА В PNG (tk_media_cards)
+# ТТК / КАРТОЧКИ + ШРИФТ И РЕНДЕР В PNG (tk_media_cards)
 # =========================================================
+def ensure_cyrillic_font_path() -> str | None:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "DejaVuSans.ttf"),
+        os.path.join(base_dir, "font.ttf"),
+        FONT_CACHE_PATH,
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 10000:
+            return path
+
+    font_urls = [
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
+    ]
+    for url in font_urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read()
+            if len(data) > 50000:
+                with open(FONT_CACHE_PATH, "wb") as f:
+                    f.write(data)
+                print(f"[FONT] Cached Cyrillic font at {FONT_CACHE_PATH}", flush=True)
+                return FONT_CACHE_PATH
+        except Exception as e:
+            print(f"[WARN] Font download failed ({url}): {e}", flush=True)
+    return None
+
+
+def load_ttk_fonts():
+    font_path = ensure_cyrillic_font_path()
+    if font_path:
+        try:
+            return (
+                ImageFont.truetype(font_path, 38),
+                ImageFont.truetype(font_path, 23),
+                ImageFont.truetype(font_path, 18),
+            )
+        except Exception as e:
+            print(f"[WARN] ImageFont.truetype failed ({font_path}): {e}", flush=True)
+    return ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default()
+
+
 def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> bytes | None:
     if not PIL_AVAILABLE:
         return None
@@ -567,22 +615,15 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     draw = ImageDraw.Draw(img)
     draw.rectangle([24, 24, 936, 536], outline=(212, 168, 83), width=3)
 
-    try:
-        font_title = ImageFont.truetype("arial.ttf", 40)
-        font_body = ImageFont.truetype("arial.ttf", 24)
-        font_small = ImageFont.truetype("arial.ttf", 19)
-    except Exception:
-        font_title = ImageFont.load_default()
-        font_body = ImageFont.load_default()
-        font_small = ImageFont.load_default()
+    font_title, font_body, font_small = load_ttk_fonts()
 
     header = f"ТЕХНОЛОГИЧЕСКАЯ КАРТА • {category.upper()}" if category else "ТЕХНОЛОГИЧЕСКАЯ КАРТА • ТТК"
     draw.text((56, 54), header, fill=(212, 168, 83), font=font_small)
 
     y = 100
-    for line in textwrap.wrap(title, width=32)[:2]:
+    for line in textwrap.wrap(title, width=30)[:2]:
         draw.text((56, y), line, fill=(255, 255, 255), font=font_title)
-        y += 48
+        y += 46
 
     draw.line([(56, y + 10), (904, y + 10)], fill=(70, 70, 80), width=2)
     y += 28
@@ -590,7 +631,7 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     raw_lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
     wrapped_lines: list[str] = []
     for raw_ln in raw_lines:
-        wrapped_lines.extend(textwrap.wrap(raw_ln, width=62) or [""])
+        wrapped_lines.extend(textwrap.wrap(raw_ln, width=58) or [""])
 
     for ln in wrapped_lines[:11]:
         draw.text((56, y), ln, fill=(225, 225, 232), font=font_body)
@@ -1523,7 +1564,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.10] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.11] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
