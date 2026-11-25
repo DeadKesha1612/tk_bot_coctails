@@ -227,6 +227,29 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     return kb
 
 
+def ttk_buttons_keyboard(page_cards: list[dict], page: int, total_pages: int) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for i in range(0, len(page_cards), 2):
+        c1 = page_cards[i]
+        b1 = types.KeyboardButton(str(c1.get("title") or "Без названия")[:64])
+        if i + 1 < len(page_cards):
+            c2 = page_cards[i + 1]
+            b2 = types.KeyboardButton(str(c2.get("title") or "Без названия")[:64])
+            kb.row(b1, b2)
+        else:
+            kb.row(b1)
+
+    nav = []
+    if page > 0:
+        nav.append(types.KeyboardButton(BTN_TTK_PREV))
+    if page + 1 < total_pages:
+        nav.append(types.KeyboardButton(BTN_TTK_NEXT))
+    if nav:
+        kb.row(*nav)
+    kb.row(types.KeyboardButton(BTN_BACK))
+    return kb
+
+
 def dishware_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     with DATA_LOCK:
@@ -646,7 +669,6 @@ def load_ttk_card_fonts():
 
 
 def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """Разбирает текст ТТК на строки таблицы СОСТАВ (позиция, количество) и строки ПРИГОТОВЛЕНИЕ."""
     ingredients: list[tuple[str, str]] = []
     prep_lines: list[str] = []
     in_prep = False
@@ -665,8 +687,11 @@ def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str
             prep_lines.append(ln)
             continue
 
-        # Строка формата "Выход: 120 мл", "Джин - 30 мл", "Водка 40" или "Водка\t40"
-        m_sep = re.match(r"^(.+?)\s*(?:\t|\s{2,}|[:—–-])\s*(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)?)$", ln, flags=re.I)
+        m_sep = re.match(
+            r"^(.+?)\s*(?:\t|\s{2,}|[:—–-])\s*(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)?)$",
+            ln,
+            flags=re.I,
+        )
         if not m_sep:
             m_sep = re.match(r"^(.+?)\s+(\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап))$", ln, flags=re.I)
 
@@ -703,13 +728,10 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     card_x0 = outer_pad
     card_y0 = outer_pad
     card_x1 = canvas_w - outer_pad
-    card_w = card_x1 - card_x0
 
     inner_x0 = card_x0 + 68
     inner_x1 = card_x1 - 68
-    inner_w = inner_x1 - inner_x0
 
-    # Предварительно заворачиваем строки
     title_lines = textwrap.wrap(title.upper(), width=38) or [title.upper()]
     wrapped_ing: list[tuple[str, str]] = []
     for name, qty in ingredients:
@@ -721,7 +743,6 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     for p_line in prep_lines:
         wrapped_prep.extend(textwrap.wrap(p_line, width=78) or [p_line])
 
-    # Рассчитываем высоту карточки
     est_h = 110 + len(title_lines) * 44 + 40
     if wrapped_ing:
         est_h += 95 + len(wrapped_ing) * 46 + 24
@@ -735,7 +756,6 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     img = Image.new("RGB", (canvas_w, canvas_h), color=(28, 30, 36))
     draw = ImageDraw.Draw(img)
 
-    # Светлая карточка со скруглёнными углами как на референсе
     draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=24, fill=(246, 247, 249))
 
     y = card_y0 + 54
@@ -756,7 +776,12 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
 
         draw.text((inner_x0, y), "ИНГРЕДИЕНТ / ПОЗИЦИЯ", fill=(122, 128, 138), font=fonts["col_head"])
         qty_hdr = "КОЛИЧЕСТВО"
-        draw.text((inner_x1 - _text_width(draw, qty_hdr, fonts["col_head"]), y), qty_hdr, fill=(122, 128, 138), font=fonts["col_head"])
+        draw.text(
+            (inner_x1 - _text_width(draw, qty_hdr, fonts["col_head"]), y),
+            qty_hdr,
+            fill=(122, 128, 138),
+            font=fonts["col_head"],
+        )
         y += 28
 
         for idx, (ing_name, ing_qty) in enumerate(wrapped_ing):
@@ -1055,6 +1080,45 @@ def find_media_matches(query: str) -> list[dict]:
     return [c for c in cards if q in norm_text(c.get("title"))]
 
 
+def show_ttk_buttons_page(
+    msg: types.Message,
+    cards: list[dict],
+    header_title: str,
+    page: int = 0,
+    category_key: str = "",
+) -> None:
+    uid = msg.from_user.id
+    if not cards:
+        USER_STATES.pop(uid, None)
+        safe_send_text(
+            msg.chat.id,
+            f"Раздел <b>{esc(header_title)}</b> пока пуст.",
+            reply_markup=recipes_menu_keyboard(uid),
+        )
+        return
+
+    per_page = 12
+    total_pages = max(1, (len(cards) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * per_page
+    chunk = cards[start_idx : start_idx + per_page]
+
+    USER_STATES[uid] = {
+        "mode": "ttk_buttons_browse",
+        "page": page,
+        "header": header_title,
+        "category": category_key,
+    }
+
+    kb = ttk_buttons_keyboard(chunk, page, total_pages)
+    page_note = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
+    safe_send_text(
+        msg.chat.id,
+        f"<b>{esc(header_title)}</b>{esc(page_note)} — нажми кнопку с ТТК, чтобы получить картинку:",
+        reply_markup=kb,
+    )
+
+
 def show_ttk_manage_page(msg: types.Message, page: int = 0) -> None:
     uid = msg.from_user.id
     if not is_admin(uid):
@@ -1110,58 +1174,27 @@ def open_ttk_card_actions(msg: types.Message, card: dict) -> None:
 # =========================================================
 # РЕЦЕПТЫ, ПОМОЩЬ, ПОЛЬЗОВАТЕЛИ, ПОДДЕРЖКА
 # =========================================================
-def show_recipe_category(msg: types.Message, category_label: str) -> None:
-    uid = msg.from_user.id
+def get_cards_for_category(category_label: str) -> tuple[str, list[dict]]:
     clean_cat = norm_text(re.sub(r"^[^\wа-яё]+\s*", "", category_label, flags=re.I))
-
     with DATA_LOCK:
-        recipes = [
-            r for r in DB.get("recipes", [])
-            if norm_text(r.get("category") or r.get("type") or "") == clean_cat
-        ]
-        cards = list(DB.get("media_cards", []))
-
-    cat_cards = [c for c in cards if norm_text(c.get("category")) == clean_cat]
-    display_cards = cat_cards if cat_cards else (cards if not recipes else [])
-
-    lines = []
-    for r in recipes[:40]:
-        lines.append(f"• <b>{esc(r.get('name') or r.get('title') or 'Без названия')}</b>")
-    for c in display_cards[:40]:
-        lines.append(f"• 🖼 <b>{esc(c.get('title') or '')}</b>")
-
-    if not lines:
-        safe_send_text(
-            msg.chat.id,
-            f"Раздел <b>{esc(category_label)}</b> пока пуст.",
-            reply_markup=recipes_menu_keyboard(uid),
-        )
-        return
-
-    safe_send_text(
-        msg.chat.id,
-        f"<b>{esc(category_label)}</b> ({len(lines)}):\n\n"
-        + "\n".join(lines)
-        + "\n\n<i>Напиши название текстом, чтобы получить файл/карточку.</i>",
-        reply_markup=recipes_menu_keyboard(uid),
-    )
+        all_cards = list(DB.get("media_cards", []))
+    matched = [c for c in all_cards if norm_text(c.get("category")) == clean_cat]
+    if matched:
+        return clean_cat, matched
+    if clean_cat == "классические":
+        return clean_cat, all_cards
+    return clean_cat, []
 
 
-def show_media_cards_list(msg: types.Message) -> None:
-    uid = msg.from_user.id
+def show_recipe_category(msg: types.Message, category_label: str, page: int = 0) -> None:
+    clean_cat, cards = get_cards_for_category(category_label)
+    show_ttk_buttons_page(msg, cards, category_label, page=page, category_key=clean_cat)
+
+
+def show_media_cards_list(msg: types.Message, page: int = 0) -> None:
     with DATA_LOCK:
         cards = list(DB.get("media_cards", []))
-    if not cards:
-        safe_send_text(msg.chat.id, "Сохранённых карточек пока нет.", reply_markup=recipes_menu_keyboard(uid))
-        return
-    lines = [f"• <b>{esc(c.get('title') or '')}</b>" for c in cards[:60]]
-    safe_send_text(
-        msg.chat.id,
-        f"🖼 <b>Карточки ({len(cards)}):</b>\n\n"
-        + "\n".join(lines)
-        + "\n\n<i>Напиши название текстом, чтобы получить файл.</i>",
-        reply_markup=recipes_menu_keyboard(uid),
-    )
+    show_ttk_buttons_page(msg, cards, "🖼 Карточки", page=page, category_key="")
 
 
 def show_users_and_actions(msg: types.Message) -> None:
@@ -1357,6 +1390,35 @@ def handle_text(msg: types.Message):
             reply_markup=bulk_done_keyboard(),
         )
         return
+
+    if st.get("mode") == "ttk_buttons_browse":
+        page = int(st.get("page") or 0)
+        header = str(st.get("header") or "🖼 Карточки")
+        cat_key = str(st.get("category") or "")
+
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
+            return
+
+        if text in (BTN_TTK_NEXT, BTN_TTK_PREV):
+            new_page = page + 1 if text == BTN_TTK_NEXT else max(0, page - 1)
+            with DATA_LOCK:
+                all_cards = list(DB.get("media_cards", []))
+            if cat_key:
+                filtered = [c for c in all_cards if norm_text(c.get("category")) == cat_key]
+                cards = filtered if filtered else (all_cards if cat_key == "классические" else [])
+            else:
+                cards = all_cards
+            show_ttk_buttons_page(msg, cards, header, page=new_page, category_key=cat_key)
+            return
+
+        matched_btn = find_media_matches(text)
+        if matched_btn:
+            card = matched_btn[0]
+            log_activity(uid, username, "OPEN_CARD_BTN", str(card.get("title") or ""))
+            safe_send_media_card(msg.chat.id, card)
+            return
 
     if st.get("mode") == "add_ttk_choose_cat":
         if text == BTN_BACK:
@@ -1615,7 +1677,7 @@ def handle_text(msg: types.Message):
 
     if text == BTN_MEDIA_LIST:
         log_activity(uid, username, "OPEN_CARDS")
-        show_media_cards_list(msg)
+        show_media_cards_list(msg, page=0)
         return
 
     if text == BTN_RECIPES or low == "рецепты":
@@ -1625,7 +1687,7 @@ def handle_text(msg: types.Message):
 
     if text in (BTN_REC_AUTHOR, BTN_REC_CLASSIC, BTN_REC_INFUSIONS, BTN_REC_MENU):
         log_activity(uid, username, "RECIPES_CAT", text)
-        show_recipe_category(msg, text)
+        show_recipe_category(msg, text, page=0)
         return
 
     if text == BTN_DISHWARE or low == "посуда":
@@ -1710,7 +1772,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.12] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.13] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
