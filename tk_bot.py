@@ -1,4 +1,5 @@
 import copy
+from difflib import SequenceMatcher
 import hashlib
 import html
 import io
@@ -284,13 +285,18 @@ def _register_card_callback_key(card_id: str) -> str:
     return short_key
 
 
-def ttk_popup_keyboard(page_cards: list[dict], page: int, total_pages: int, cat_key: str) -> types.InlineKeyboardMarkup:
+def card_buttons_keyboard(cards: list[dict]) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for card in page_cards:
+    for card in cards:
         cid = str(card.get("id") or "")
         short_key = _register_card_callback_key(cid)
         title = str(card.get("title") or "Без названия")[:64]
         kb.add(types.InlineKeyboardButton(text=title, callback_data=f"{CB_CARD_PREFIX}{short_key}"))
+    return kb
+
+
+def ttk_popup_keyboard(page_cards: list[dict], page: int, total_pages: int, cat_key: str) -> types.InlineKeyboardMarkup:
+    kb = card_buttons_keyboard(page_cards)
 
     nav_buttons = []
     if total_pages > 1:
@@ -638,7 +644,6 @@ def log_activity(user_id: int, username: str, action: str, details: str = "") ->
     }
     res = sb_upsert("tk_activity_logs", sb_row, "id")
     if res is None:
-        # Запасной вариант, если в Supabase id всё ещё bigint
         num_id = int(hashlib.sha256(raw_uid.encode("utf-8")).hexdigest()[:12], 16)
         sb_row_num = dict(sb_row, id=num_id)
         sb_upsert("tk_activity_logs", sb_row_num, "id")
@@ -669,7 +674,6 @@ def touch_user(msg: types.Message) -> None:
         LAST_SEEN_SYNC[uid] = now_ts
         res = sb_upsert("tk_users", row, "user_id")
         if res is None:
-            # Запасной вариант для схемы, где первичный ключ id хранит user_id
             sb_upsert("tk_users", {"id": uid, **row}, "id")
 
 
@@ -837,11 +841,21 @@ def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str
     raw_lines = [ln.strip() for ln in (body_text or "").splitlines() if ln.strip()]
     for ln in raw_lines:
         low = norm_text(ln)
-        if re.match(r"^(приготовление|способ приготовления|метод)[:：]?$", low):
+        if re.match(r"^(приготовление|способ приготовления|метод|описание)[:：]?$", low):
             in_prep = True
             continue
         if re.match(r"^(состав|ингредиенты)[:：]?$", low):
             in_prep = False
+            continue
+
+        m_prep_inline = re.match(
+            r"^(?:приготовление|способ приготовления|метод|описание)\s*[:：—–-]\s*(.+)$",
+            ln,
+            flags=re.I,
+        )
+        if m_prep_inline:
+            in_prep = True
+            prep_lines.append(m_prep_inline.group(1).strip())
             continue
 
         if in_prep:
@@ -870,6 +884,49 @@ def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str
         prep_lines.append(title)
 
     return ingredients, prep_lines
+
+
+def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
+    text = (raw_text or "").strip()
+    if not text:
+        return []
+
+    # Явные разделители блоков: ---, ===, ***
+    explicit_chunks = re.split(r"(?m)^\s*(?:-{3,}|={3,}|\*{3,})\s*$", text)
+    blocks: list[str] = []
+
+    for chunk in explicit_chunks:
+        clean_chunk = chunk.strip()
+        if not clean_chunk:
+            continue
+        # Если внутри чанка несколько параграфов через пустую строку,
+        # объединяем строки состава/приготовления к текущему коктейлю,
+        # а новый параграф с коротким названием + телом начинаем как отдельный коктейль.
+        paras = [p.strip() for p in re.split(r"\n\s*\n+", clean_chunk) if p.strip()]
+        if len(paras) <= 1:
+            blocks.append(clean_chunk)
+            continue
+
+        current_lines: list[str] = []
+        for p in paras:
+            p_lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
+            first_line = p_lines[0] if p_lines else ""
+            is_new_cocktail_header = (
+                len(p_lines) >= 2
+                and len(first_line) <= 65
+                and not re.match(r"^(?:приготовление|способ приготовления|метод|описание|состав|ингредиенты)\b", first_line, flags=re.I)
+                and not re.search(r"\d+(?:[.,]\d+)?\s*(?:мл|г|гр|кг|л|шт|дэш|кап)\b", first_line, flags=re.I)
+            )
+            if current_lines and is_new_cocktail_header:
+                blocks.append("\n".join(current_lines))
+                current_lines = list(p_lines)
+            else:
+                current_lines.extend(p_lines)
+
+        if current_lines:
+            blocks.append("\n".join(current_lines))
+
+    return blocks
 
 
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> int:
@@ -1027,10 +1084,10 @@ def persist_media_card(card: dict) -> bool:
     return False
 
 
-def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) -> tuple[bool, dict | str]:
-    lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+def create_single_ttk_block(block_text: str, category: str, uid: int, username: str) -> tuple[bool, dict | str]:
+    lines = [ln.strip() for ln in (block_text or "").splitlines() if ln.strip()]
     if not lines:
-        return False, "Текст пуст — напиши название и описание/состав ТТК."
+        return False, "Блок ТТК пуст."
 
     if len(lines) == 1:
         single = lines[0]
@@ -1046,8 +1103,9 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
         body = "\n".join(lines[1:])
 
     if not title:
-        return False, "Не удалось определить название ТТК."
+        return False, "Не удалось определить название коктейля."
 
+    # Уникальный ID для каждой отдельной карточки/фото
     card_id = f"media_{uuid.uuid4().hex[:10]}"
     png_bytes = render_ttk_png_bytes(title, body, category=category)
     local_path, storage_path = (
@@ -1078,6 +1136,9 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
             None,
         )
         if existing:
+            old_storage = existing.get("storage_path")
+            if old_storage and old_storage != storage_path:
+                storage_delete_object(str(old_storage))
             existing["photo_path"] = local_path
             existing["storage_path"] = storage_path
             existing["photo_file_id"] = None
@@ -1091,6 +1152,25 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
 
     log_activity(uid, username, "TTK_CREATE_TEXT", f"{title} [{category or 'без категории'}]")
     return True, card
+
+
+def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) -> tuple[bool, list[dict] | str]:
+    blocks = _split_multi_ttk_blocks(raw_text)
+    if not blocks:
+        return False, "Текст пуст — напиши название, состав и описание приготовления ТТК."
+
+    created_cards: list[dict] = []
+    errors: list[str] = []
+    for blk in blocks:
+        ok, res = create_single_ttk_block(blk, category, uid, username)
+        if ok and isinstance(res, dict):
+            created_cards.append(res)
+        elif isinstance(res, str):
+            errors.append(res)
+
+    if not created_cards:
+        return False, errors[0] if errors else "Не удалось создать карточки ТТК."
+    return True, created_cards
 
 
 def clean_existing_media_titles(uid: int, username: str) -> list[tuple[str, str]]:
@@ -1387,6 +1467,25 @@ def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
     )
 
 
+def _similarity_score(query_clean: str, title_clean: str) -> float:
+    if not query_clean or not title_clean:
+        return 0.0
+    if query_clean == title_clean:
+        return 1.0
+    full_ratio = SequenceMatcher(None, query_clean, title_clean).ratio()
+    q_words = query_clean.split()
+    t_words = title_clean.split()
+
+    best_word_ratio = 0.0
+    for qw in q_words:
+        if qw in title_clean:
+            best_word_ratio = max(best_word_ratio, 0.85)
+        for tw in t_words:
+            best_word_ratio = max(best_word_ratio, SequenceMatcher(None, qw, tw).ratio())
+
+    return max(full_ratio, best_word_ratio * 0.92)
+
+
 def find_media_matches(query: str) -> list[dict]:
     q_raw = norm_text(query)
     q_clean = search_clean_text(query)
@@ -1408,9 +1507,7 @@ def find_media_matches(query: str) -> list[dict]:
     if not keywords:
         return [c for c in cards if q_raw in norm_text(c.get("title"))]
 
-    all_words_matches: list[tuple[int, dict]] = []
-    partial_matches: list[tuple[int, dict]] = []
-
+    scored: list[tuple[float, dict]] = []
     for c in cards:
         title_clean = search_clean_text(c.get("title"))
         title_words = title_clean.split()
@@ -1419,18 +1516,18 @@ def find_media_matches(query: str) -> list[dict]:
             if kw in title_words or any(kw in tw for tw in title_words) or kw in title_clean:
                 matched_count += 1
 
+        sim = _similarity_score(q_clean, title_clean)
         if matched_count == len(keywords):
-            score = matched_count * 10 + (1 if q_clean in title_clean else 0)
-            all_words_matches.append((score, c))
+            score = 10.0 + matched_count + (1.5 if q_clean in title_clean else 0.0) + sim
+            scored.append((score, c))
         elif matched_count > 0:
-            partial_matches.append((matched_count, c))
+            score = 5.0 + matched_count * 1.5 + sim
+            scored.append((score, c))
+        elif sim >= 0.52:
+            scored.append((sim * 4.0, c))
 
-    if all_words_matches:
-        all_words_matches.sort(key=lambda pair: pair[0], reverse=True)
-        return [c for _, c in all_words_matches]
-
-    partial_matches.sort(key=lambda pair: pair[0], reverse=True)
-    return [c for _, c in partial_matches]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [c for _, c in scored[:8]]
 
 
 def _get_filtered_cards(category_key: str) -> list[dict]:
@@ -1914,10 +2011,11 @@ def handle_text(msg: types.Message):
         safe_send_text(
             msg.chat.id,
             f"Категория: <b>{esc(chosen_cat or 'без категории')}</b>.\n\n"
-            "Напиши ТТК текстом:\n"
-            "• 1-я строка — <b>название</b>\n"
-            "• Строки с количеством (например, <code>Выход: 120 мл</code>, <code>Джин 30 мл</code>) — уйдут в таблицу <b>СОСТАВ</b>\n"
-            "• Остальные строки — в блок <b>ПРИГОТОВЛЕНИЕ</b>",
+            "Напиши ТТК текстом (можно сразу несколько коктейлей через <code>---</code> или пустую строку):\n"
+            "• 1-я строка блока — <b>название коктейля</b>\n"
+            "• Строки с количеством — в таблицу <b>СОСТАВ</b> (например, <code>Джин 40 мл</code>)\n"
+            "• Строка с описанием приготовления — в блок <b>ПРИГОТОВЛЕНИЕ</b> "
+            "(например, <code>Приготовление: смешать со льдом и процедить</code>)",
             reply_markup=back_only_keyboard(),
         )
         return
@@ -1933,15 +2031,23 @@ def handle_text(msg: types.Message):
         if not ok:
             safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=recipes_menu_keyboard(uid))
             return
-        card = res
-        if not card.get("photo_path") and not card.get("storage_path"):
+        created_cards = res
+        if not PIL_AVAILABLE:
+            names = ", ".join(esc(c.get("title") or "") for c in created_cards)
             safe_send_text(
                 msg.chat.id,
-                f"⚠️ Карточка <b>{esc(card.get('title'))}</b> сохранена, но модуль Pillow не установлен — PNG не сгенерирован.",
+                f"⚠️ Сохранено карточек: <b>{len(created_cards)}</b> ({names}), но модуль Pillow не установлен — PNG не сгенерирован.",
                 reply_markup=recipes_menu_keyboard(uid),
             )
             return
-        safe_send_media_card(msg.chat.id, card, reply_markup=recipes_menu_keyboard(uid))
+
+        for idx, card in enumerate(created_cards):
+            is_last = idx == len(created_cards) - 1
+            safe_send_media_card(
+                msg.chat.id,
+                card,
+                reply_markup=recipes_menu_keyboard(uid) if is_last else None,
+            )
         return
 
     if st.get("mode") == "ttk_choose_tab":
@@ -2312,8 +2418,12 @@ def handle_text(msg: types.Message):
     log_activity(uid, username, "SEARCH", text[:120])
     matches = find_media_matches(text)
     if matches:
-        for card in matches[:5]:
-            safe_send_media_card(msg.chat.id, card, reply_markup=main_menu_keyboard(uid))
+        kb = card_buttons_keyboard(matches)
+        safe_send_text(
+            msg.chat.id,
+            f"🔎 Похожие названия по запросу «<b>{esc(text)}</b>» — выбери карточку:",
+            reply_markup=kb,
+        )
         return
 
     safe_send_text(msg.chat.id, f"Ничего не найдено по запросу «{esc(text)}».", reply_markup=main_menu_keyboard(uid))
@@ -2345,7 +2455,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.26] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.29] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
