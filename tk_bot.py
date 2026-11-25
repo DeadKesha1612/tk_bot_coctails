@@ -136,7 +136,6 @@ def norm_text(value: str | None) -> str:
 
 
 def search_clean_text(value: str | None) -> str:
-    """Очищает название/запрос от подчёркиваний и спецсимволов для поиска по словам."""
     cleaned = re.sub(r"[_\-—–/\\.,:;!?()\"'«»№*+#]+", " ", (value or "").lower())
     return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -1061,18 +1060,23 @@ def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
     if photo_path and os.path.isfile(photo_path):
         try:
             with open(photo_path, "rb") as f:
-                bot.send_document(chat_id, f, caption=caption, reply_markup=reply_markup)
-            return
-        except Exception as e:
-            print(f"[WARN] send media from disk failed: {e}", flush=True)
-
-    if file_id:
-        try:
-            bot.send_document(chat_id, file_id, caption=caption, reply_markup=reply_markup)
+                bot.send_photo(chat_id, f, caption=caption, reply_markup=reply_markup)
             return
         except Exception:
             try:
-                bot.send_photo(chat_id, file_id, caption=caption, reply_markup=reply_markup)
+                with open(photo_path, "rb") as f:
+                    bot.send_document(chat_id, f, caption=caption, reply_markup=reply_markup)
+                return
+            except Exception as e:
+                print(f"[WARN] send media from disk failed: {e}", flush=True)
+
+    if file_id:
+        try:
+            bot.send_photo(chat_id, file_id, caption=caption, reply_markup=reply_markup)
+            return
+        except Exception:
+            try:
+                bot.send_document(chat_id, file_id, caption=caption, reply_markup=reply_markup)
                 return
             except Exception as e:
                 print(f"[WARN] send media by file_id failed: {e}", flush=True)
@@ -1838,7 +1842,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.15] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.16] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
