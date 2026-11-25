@@ -46,6 +46,13 @@ ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 SUPABASE_STORAGE_ENABLED = bool(SUPABASE_ENABLED and SUPABASE_STORAGE_BUCKET)
 
+DISHWARE_ALLOWED_USERNAMES = {
+    "deadkesha",
+    "aveinx",
+    "dragonmaycry07",
+    "vladizavrrr",
+}
+
 DATA_DIR = os.getenv("DATA_DIR", "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "user_media")
 FONT_CACHE_PATH = os.path.join(DATA_DIR, "DejaVuSans.ttf")
@@ -205,6 +212,22 @@ def is_admin(user_id: int) -> bool:
     return False
 
 
+def can_manage_dishware(user_id: int, username: str | None = "") -> bool:
+    if is_admin(user_id):
+        return True
+    uname = (username or "").strip().lstrip("@").lower()
+    if uname and uname in DISHWARE_ALLOWED_USERNAMES:
+        return True
+    if user_id:
+        with DATA_LOCK:
+            for u in DB.get("users", []):
+                if int(u.get("user_id") or 0) == int(user_id):
+                    stored_u = str(u.get("username") or "").strip().lstrip("@").lower()
+                    if stored_u and stored_u in DISHWARE_ALLOWED_USERNAMES:
+                        return True
+    return False
+
+
 def require_admin_msg(msg: types.Message) -> bool:
     uid = msg.from_user.id if msg.from_user else 0
     if is_admin(uid):
@@ -213,6 +236,19 @@ def require_admin_msg(msg: types.Message) -> bool:
         msg.chat.id,
         "⛔ Это действие доступно только администратору. Ты можешь нажать «💡 Предложить коктейль».",
         reply_markup=main_menu_keyboard(uid),
+    )
+    return False
+
+
+def require_dishware_msg(msg: types.Message) -> bool:
+    uid = msg.from_user.id if msg.from_user else 0
+    uname = (msg.from_user.username or "") if msg.from_user else ""
+    if can_manage_dishware(uid, uname):
+        return True
+    safe_send_text(
+        msg.chat.id,
+        "⛔ Раздел посуды и подсчёт остатков доступны только авторизованным пользователям и администратору.",
+        reply_markup=main_menu_keyboard(uid, uname),
     )
     return False
 
@@ -268,11 +304,16 @@ def parse_number_selection(raw: str, max_index: int) -> list[int]:
 # =========================================================
 # КЛАВИАТУРЫ
 # =========================================================
-def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+def main_menu_keyboard(user_id: int, username: str = "") -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton(BTN_RECIPES), types.KeyboardButton(BTN_SUGGEST_COCKTAIL))
-    if is_admin(user_id):
-        kb.row(types.KeyboardButton(BTN_DISHWARE), types.KeyboardButton(BTN_USERS))
+    if can_manage_dishware(user_id, username):
+        if is_admin(user_id):
+            kb.row(types.KeyboardButton(BTN_DISHWARE), types.KeyboardButton(BTN_USERS))
+        else:
+            kb.row(types.KeyboardButton(BTN_DISHWARE))
+    elif is_admin(user_id):
+        kb.row(types.KeyboardButton(BTN_USERS))
     kb.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_SUPPORT))
     return kb
 
@@ -671,6 +712,7 @@ def log_activity(user_id: int, username: str, action: str, details: str = "") ->
         "username": entry["username"],
         "action": f"{action}: {details}" if details else action,
         "created_at": entry["created_at"],
+        "ts": entry["created_at"],
     }
     res = sb_upsert("tk_activity_logs", sb_row, "id")
     if res is None:
@@ -775,6 +817,49 @@ def format_dishware_summary() -> str:
     lines = [f"• {esc(d.get('name') or '')}: <b>{int(d.get('qty') or 0)}шт</b>" for d in items]
     lines.append(f"\n<b>Итого позиций:</b> {len(items)} | <b>Всего штук:</b> {total_pcs}шт")
     return "📊 <b>Подсчёт остатков посуды:</b>\n\n" + "\n".join(lines)
+
+
+# =========================================================
+# РАССЫЛКА ПОЛЬЗОВАТЕЛЯМ (/broadcast)
+# =========================================================
+def collect_all_recipient_ids() -> list[int]:
+    ids: set[int] = set()
+    with DATA_LOCK:
+        for u in DB.get("users", []):
+            raw_uid = u.get("user_id")
+            if raw_uid is not None and str(raw_uid).isdigit():
+                val = int(raw_uid)
+                if val > 0:
+                    ids.add(val)
+        for a in DB.get("activity_logs", []):
+            raw_uid = a.get("user_id")
+            if raw_uid is not None and str(raw_uid).isdigit():
+                val = int(raw_uid)
+                if val > 0:
+                    ids.add(val)
+    return sorted(ids)
+
+
+def send_broadcast_to_all(announcement_text: str, admin_uid: int, admin_username: str) -> tuple[int, int]:
+    recipients = collect_all_recipient_ids()
+    sent_ok = 0
+    sent_fail = 0
+    payload = f"📢 <b>Обновление бота</b>\n\n{esc(announcement_text)}"
+
+    for uid in recipients:
+        try:
+            res = bot.send_message(uid, payload)
+            if res:
+                sent_ok += 1
+            else:
+                sent_fail += 1
+        except Exception as e:
+            sent_fail += 1
+            print(f"[WARN] broadcast failed for uid={uid}: {e}", flush=True)
+        time.sleep(0.05)
+
+    log_activity(admin_uid, admin_username, "BROADCAST", f"sent={sent_ok}, failed={sent_fail}")
+    return sent_ok, sent_fail
 
 
 # =========================================================
@@ -1978,6 +2063,7 @@ def show_users_and_actions(msg: types.Message) -> None:
 
 def send_support_link(msg: types.Message) -> None:
     uid = msg.from_user.id
+    uname = msg.from_user.username or ""
     with DATA_LOCK:
         sup_raw = str((DB.get("support") or {}).get("text") or "").strip()
     url = sup_raw if sup_raw.startswith(("http://", "https://")) else DONATIONALERTS_URL
@@ -1988,7 +2074,7 @@ def send_support_link(msg: types.Message) -> None:
         f"💛 <b>Поддержка проекта</b>\n{esc(url)}",
         reply_markup=kb,
     )
-    safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+    safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid, uname))
 
 
 def ask_bulk_category(msg: types.Message) -> None:
@@ -2028,6 +2114,7 @@ def start_bulk_mode(msg: types.Message, active_category: str = "") -> None:
 
 def finish_bulk_mode(msg: types.Message) -> None:
     uid = msg.from_user.id
+    uname = msg.from_user.username or ""
     st = USER_STATES.pop(uid, {})
     count = int(st.get("count") or 0)
     titles = st.get("titles") or []
@@ -2038,7 +2125,7 @@ def finish_bulk_mode(msg: types.Message) -> None:
         msg.chat.id,
         f"✅ Загрузка завершена (вкладка: <b>{esc(cat_label)}</b>). Сохранено файлов: <b>{count}</b>"
         + (f"\n\n{preview}{extra}" if preview else ""),
-        reply_markup=main_menu_keyboard(uid),
+        reply_markup=main_menu_keyboard(uid, uname),
     )
 
 
@@ -2181,12 +2268,13 @@ def handle_ttk_callback(call: types.CallbackQuery):
 def cmd_start(msg: types.Message):
     touch_user(msg)
     uid = msg.from_user.id
+    uname = msg.from_user.username or ""
     USER_STATES.pop(uid, None)
-    log_activity(uid, msg.from_user.username or "", "START")
+    log_activity(uid, uname, "START")
     safe_send_text(
         msg.chat.id,
         "Привет! Выбери раздел в меню или напиши название для поиска.",
-        reply_markup=main_menu_keyboard(uid),
+        reply_markup=main_menu_keyboard(uid, uname),
     )
 
 
@@ -2204,6 +2292,23 @@ def cmd_clean_titles(msg: types.Message):
     if not require_admin_msg(msg):
         return
     run_clean_titles_report(msg)
+
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(msg: types.Message):
+    touch_user(msg)
+    if not require_admin_msg(msg):
+        return
+    uid = msg.from_user.id
+    USER_STATES[uid] = {"mode": "admin_broadcast"}
+    total_users = len(collect_all_recipient_ids())
+    safe_send_text(
+        msg.chat.id,
+        f"📢 <b>Рассылка всем пользователям</b> (найдено получателей: <b>{total_users}</b>).\n\n"
+        "Отправь следующим сообщением текст обновления — он уйдёт всем пользователям.\n"
+        "Чтобы отменить, нажми <b>⬅️ Назад</b>.",
+        reply_markup=back_only_keyboard(),
+    )
 
 
 @bot.message_handler(content_types=["document", "photo"])
@@ -2267,7 +2372,7 @@ def handle_media_upload(msg: types.Message):
             msg.chat.id,
             f"✅ Сохранено в «<b>{esc(cat_text)}</b>»: <b>{esc(title)}</b>\n"
             f"<i>Чтобы выбрать вкладку при загрузке, используй «📥 Массовая загрузка» или «🗂 Категория» в «✏️ Ред. / Удалить ТТК».</i>",
-            reply_markup=main_menu_keyboard(uid),
+            reply_markup=main_menu_keyboard(uid, username),
         )
 
 
@@ -2280,10 +2385,31 @@ def handle_text(msg: types.Message):
     low = norm_text(text)
     st = USER_STATES.get(uid) or {}
 
+    if st.get("mode") == "admin_broadcast":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "Рассылка отменена. Главное меню:", reply_markup=main_menu_keyboard(uid, username))
+            return
+        if not text:
+            safe_send_text(msg.chat.id, "Текст рассылки не может быть пустым.", reply_markup=back_only_keyboard())
+            return
+        USER_STATES.pop(uid, None)
+        safe_send_text(msg.chat.id, "⏳ Отправляю уведомление всем пользователям...")
+        ok_cnt, fail_cnt = send_broadcast_to_all(text, uid, username)
+        safe_send_text(
+            msg.chat.id,
+            f"✅ Рассылка завершена.\nДоставлено: <b>{ok_cnt}</b> | Ошибок/заблокировано: <b>{fail_cnt}</b>",
+            reply_markup=main_menu_keyboard(uid, username),
+        )
+        return
+
     if st.get("mode") == "suggest_choose_cat":
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
-            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid, username))
             return
         chosen_cat = "" if low == "без категории" else low
         if chosen_cat and chosen_cat not in TTK_CATEGORIES:
@@ -2313,12 +2439,12 @@ def handle_text(msg: types.Message):
         USER_STATES.pop(uid, None)
         ok, res = submit_cocktail_suggestion(msg, text, category=cat)
         if not ok:
-            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=main_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=main_menu_keyboard(uid, username))
             return
         safe_send_text(
             msg.chat.id,
             f"✅ Предложение «<b>{esc(res)}</b>» отправлено администратору на рассмотрение!",
-            reply_markup=main_menu_keyboard(uid),
+            reply_markup=main_menu_keyboard(uid, username),
         )
         return
 
@@ -2328,7 +2454,7 @@ def handle_text(msg: types.Message):
             return
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
-            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid, username))
             return
         chosen_cat = "" if low == "без категории" else low
         if chosen_cat and chosen_cat not in TTK_CATEGORIES:
@@ -2346,7 +2472,7 @@ def handle_text(msg: types.Message):
             return
         if text == BTN_CANCEL:
             USER_STATES.pop(uid, None)
-            safe_send_text(msg.chat.id, "❌ Загрузка отменена.", reply_markup=main_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, "❌ Загрузка отменена.", reply_markup=main_menu_keyboard(uid, username))
             return
         max_files = int(st.get("max_files") or MAX_BULK_FILES)
         cur = int(st.get("count") or 0)
@@ -2669,7 +2795,7 @@ def handle_text(msg: types.Message):
     if st.get("mode") == "help_wait_text":
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
-            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid, username))
             return
         USER_STATES.pop(uid, None)
         log_activity(uid, username, "HELP_REQUEST", text[:200])
@@ -2685,12 +2811,12 @@ def handle_text(msg: types.Message):
         safe_send_text(
             msg.chat.id,
             "✅ Запрос отправлен администратору.",
-            reply_markup=main_menu_keyboard(uid),
+            reply_markup=main_menu_keyboard(uid, username),
         )
         return
 
     if st.get("mode") == "dishware_item":
-        if not require_admin_msg(msg):
+        if not require_dishware_msg(msg):
             USER_STATES.pop(uid, None)
             return
         item_id = st.get("item_id")
@@ -2723,7 +2849,7 @@ def handle_text(msg: types.Message):
 
     if text == BTN_BACK:
         USER_STATES.pop(uid, None)
-        safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+        safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid, username))
         return
 
     if text == BTN_SUGGEST_COCKTAIL or low in ("предложить коктейль", "предложить"):
@@ -2770,15 +2896,19 @@ def handle_text(msg: types.Message):
         return
 
     if text == BTN_DISHWARE or low == "посуда":
-        if not require_admin_msg(msg):
+        if not require_dishware_msg(msg):
             return
         USER_STATES.pop(uid, None)
         log_activity(uid, username, "OPEN_DISHWARE")
-        safe_send_text(msg.chat.id, "🥃 Выбери позицию посуды:", reply_markup=dishware_menu_keyboard(uid))
+        safe_send_text(
+            msg.chat.id,
+            "🥃 Выбери позицию посуды — можно записать привоз в плюс (<code>+10</code>), списание в минус (<code>-3</code>) или точный остаток:",
+            reply_markup=dishware_menu_keyboard(uid),
+        )
         return
 
-    if text == BTN_DISH_SUMMARY:
-        if not require_admin_msg(msg):
+    if text == BTN_DISH_SUMMARY or low in ("подсчёт остатков", "подсчет остатков"):
+        if not require_dishware_msg(msg):
             return
         log_activity(uid, username, "DISHWARE_SUMMARY")
         safe_send_text(msg.chat.id, format_dishware_summary(), reply_markup=dishware_menu_keyboard(uid))
@@ -2786,7 +2916,7 @@ def handle_text(msg: types.Message):
 
     matched_dish = match_dishware_button(text)
     if matched_dish:
-        if not require_admin_msg(msg):
+        if not require_dishware_msg(msg):
             return
         USER_STATES[uid] = {
             "mode": "dishware_item",
@@ -2796,7 +2926,7 @@ def handle_text(msg: types.Message):
         safe_send_text(
             msg.chat.id,
             f"🥃 <b>{esc(matched_dish.get('name'))}</b> — сейчас <b>{int(matched_dish.get('qty') or 0)}шт</b>.\n"
-            "Нажми <b>+1 / -1 / +5 / -5</b> или отправь число (например, <code>+10</code>, <code>-3</code> или <code>24</code>).",
+            "Нажми <b>+1 / -1 / +5 / -5</b> или отправь число (например, <code>+10</code> — привезли, <code>-3</code> — взяли со склада, <code>24</code> — точный остаток).",
             reply_markup=dishware_item_keyboard(),
         )
         return
@@ -2834,7 +2964,7 @@ def handle_text(msg: types.Message):
         )
         return
 
-    safe_send_text(msg.chat.id, f"Ничего не найдено по запросу «{esc(text)}».", reply_markup=main_menu_keyboard(uid))
+    safe_send_text(msg.chat.id, f"Ничего не найдено по запросу «{esc(text)}».", reply_markup=main_menu_keyboard(uid, username))
 
 
 # =========================================================
@@ -2863,7 +2993,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.32] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.34] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
