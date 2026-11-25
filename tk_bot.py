@@ -423,6 +423,11 @@ def load_local_fallback() -> dict:
 def load_data() -> None:
     with DATA_LOCK:
         data = load_local_fallback()
+        local_cat_by_id = {
+            str(c.get("id")): str(c.get("category") or "")
+            for c in data.get("media_cards", [])
+            if c.get("id")
+        }
 
         recipes = sb_select("tk_recipes", "order=created_at.asc")
         if recipes is not None:
@@ -456,7 +461,7 @@ def load_data() -> None:
                 {
                     "id": str(m.get("id")),
                     "title": str(m.get("title") or ""),
-                    "category": str(m.get("category") or ""),
+                    "category": str(m.get("category") or local_cat_by_id.get(str(m.get("id"))) or ""),
                     "photo_file_id": m.get("photo_file_id"),
                     "photo_path": m.get("photo_path"),
                     "created_at": str(m.get("created_at") or now_str()),
@@ -873,17 +878,18 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
 
 def persist_media_card(card: dict) -> None:
     sync_local_from_memory()
-    sb_upsert(
-        "tk_media_cards",
-        {
-            "id": str(card["id"]),
-            "title": str(card.get("title") or ""),
-            "photo_file_id": card.get("photo_file_id"),
-            "photo_path": card.get("photo_path"),
-            "created_at": str(card.get("created_at") or now_str()),
-        },
-        "id",
-    )
+    row = {
+        "id": str(card["id"]),
+        "title": str(card.get("title") or ""),
+        "category": str(card.get("category") or ""),
+        "photo_file_id": card.get("photo_file_id"),
+        "photo_path": card.get("photo_path"),
+        "created_at": str(card.get("created_at") or now_str()),
+    }
+    res = sb_upsert("tk_media_cards", row, "id")
+    if res is None and "category" in row:
+        row_no_cat = {k: v for k, v in row.items() if k != "category"}
+        sb_upsert("tk_media_cards", row_no_cat, "id")
 
 
 def delete_media_card_by_id(card_id: str, uid: int, username: str) -> dict | None:
@@ -937,7 +943,7 @@ def update_media_card_category(card_id: str, new_category: str, uid: int, userna
         if not card:
             return None
         card["category"] = new_category
-        sync_local_from_memory()
+        persist_media_card(card)
 
     log_activity(uid, username, "TTK_CAT", f"{card.get('title')} -> {new_category or 'без категории'}")
     return card
@@ -1179,11 +1185,7 @@ def get_cards_for_category(category_label: str) -> tuple[str, list[dict]]:
     with DATA_LOCK:
         all_cards = list(DB.get("media_cards", []))
     matched = [c for c in all_cards if norm_text(c.get("category")) == clean_cat]
-    if matched:
-        return clean_cat, matched
-    if clean_cat == "классические":
-        return clean_cat, all_cards
-    return clean_cat, []
+    return clean_cat, matched
 
 
 def show_recipe_category(msg: types.Message, category_label: str, page: int = 0) -> None:
@@ -1245,6 +1247,19 @@ def send_support_link(msg: types.Message) -> None:
     safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
 
 
+def ask_bulk_category(msg: types.Message) -> None:
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+        return
+    USER_STATES[uid] = {"mode": "bulk_choose_cat"}
+    safe_send_text(
+        msg.chat.id,
+        "📥 В какую вкладку загрузить файлы при массовой загрузке?\n\nВыбери вкладку на клавиатуре ниже:",
+        reply_markup=ttk_category_keyboard(),
+    )
+
+
 def start_bulk_mode(msg: types.Message, active_category: str = "") -> None:
     uid = msg.from_user.id
     if not is_admin(uid):
@@ -1257,9 +1272,10 @@ def start_bulk_mode(msg: types.Message, active_category: str = "") -> None:
         "titles": [],
         "category": active_category,
     }
+    cat_label = active_category or "без категории"
     safe_send_text(
         msg.chat.id,
-        f"📥 <b>Режим массовой загрузки файлов/PNG включён.</b>\n\n"
+        f"📥 <b>Режим массовой загрузки включён</b> (вкладка: <b>{esc(cat_label)}</b>).\n\n"
         f"За один сеанс можно загрузить до <b>{MAX_BULK_FILES}</b> файлов (сейчас загружено: <b>0/{MAX_BULK_FILES}</b>).\n"
         "Отправляй файлы подряд — название запишется в базу <b>один в один</b> как имя файла без расширения "
         "(например, <code>коктейль Алексей.png</code> → <code>коктейль Алексей</code>).\n\n"
@@ -1273,11 +1289,12 @@ def finish_bulk_mode(msg: types.Message) -> None:
     st = USER_STATES.pop(uid, {})
     count = int(st.get("count") or 0)
     titles = st.get("titles") or []
+    cat_label = str(st.get("category") or "") or "без категории"
     preview = "\n".join(f"• {esc(t)}" for t in titles[:20])
     extra = f"\n…и ещё {len(titles) - 20}" if len(titles) > 20 else ""
     safe_send_text(
         msg.chat.id,
-        f"✅ Загрузка завершена. Сохранено файлов: <b>{count}</b>"
+        f"✅ Загрузка завершена (вкладка: <b>{esc(cat_label)}</b>). Сохранено файлов: <b>{count}</b>"
         + (f"\n\n{preview}{extra}" if preview else ""),
         reply_markup=main_menu_keyboard(uid),
     )
@@ -1302,7 +1319,7 @@ def cmd_start(msg: types.Message):
 @bot.message_handler(commands=["bulk"])
 def cmd_bulk(msg: types.Message):
     touch_user(msg)
-    start_bulk_mode(msg)
+    ask_bulk_category(msg)
 
 
 @bot.message_handler(content_types=["document", "photo"])
@@ -1345,7 +1362,7 @@ def handle_media_upload(msg: types.Message):
 
     card = res
     title = str(card.get("title") or "")
-    log_activity(uid, username, "MEDIA_ADD", title)
+    log_activity(uid, username, "MEDIA_ADD", f"{title} [{active_cat or 'без категории'}]")
 
     if st.get("mode") == "media_bulk_add":
         st["count"] = int(st.get("count") or 0) + 1
@@ -1354,7 +1371,8 @@ def handle_media_upload(msg: types.Message):
         remaining = max(0, max_files - st["count"])
         safe_send_text(
             msg.chat.id,
-            f"➕ Сохранено (<b>{st['count']}/{max_files}</b>, осталось <b>{remaining}</b>): <b>{esc(title)}</b>",
+            f"➕ Сохранено в «<b>{esc(active_cat or 'без категории')}</b>» "
+            f"(<b>{st['count']}/{max_files}</b>, осталось <b>{remaining}</b>): <b>{esc(title)}</b>",
             reply_markup=bulk_done_keyboard(),
         )
     else:
@@ -1373,6 +1391,18 @@ def handle_text(msg: types.Message):
     text = (msg.text or "").strip()
     low = norm_text(text)
     st = USER_STATES.get(uid) or {}
+
+    if st.get("mode") == "bulk_choose_cat":
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+            return
+        chosen_cat = "" if low == "без категории" else low
+        if chosen_cat and chosen_cat not in TTK_CATEGORIES:
+            safe_send_text(msg.chat.id, "Выбери вкладку на клавиатуре ниже:", reply_markup=ttk_category_keyboard())
+            return
+        start_bulk_mode(msg, active_category=chosen_cat)
+        return
 
     if st.get("mode") == "media_bulk_add":
         if text == BTN_DONE:
@@ -1405,11 +1435,7 @@ def handle_text(msg: types.Message):
             new_page = page + 1 if text == BTN_TTK_NEXT else max(0, page - 1)
             with DATA_LOCK:
                 all_cards = list(DB.get("media_cards", []))
-            if cat_key:
-                filtered = [c for c in all_cards if norm_text(c.get("category")) == cat_key]
-                cards = filtered if filtered else (all_cards if cat_key == "классические" else [])
-            else:
-                cards = all_cards
+            cards = [c for c in all_cards if norm_text(c.get("category")) == cat_key] if cat_key else all_cards
             show_ttk_buttons_page(msg, cards, header, page=new_page, category_key=cat_key)
             return
 
@@ -1672,7 +1698,7 @@ def handle_text(msg: types.Message):
         return
 
     if text == BTN_BULK_MEDIA:
-        start_bulk_mode(msg)
+        ask_bulk_category(msg)
         return
 
     if text == BTN_MEDIA_LIST:
@@ -1772,7 +1798,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.13] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.14] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
