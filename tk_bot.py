@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import html
 import io
 import json
@@ -580,7 +581,7 @@ def load_data() -> None:
         if dishware_logs is not None:
             data["dishware_logs"] = dishware_logs
 
-        users = sb_select("tk_users", "order=last_seen.desc")
+        users = sb_select("tk_users", "limit=200")
         if users is not None:
             data["users"] = users
 
@@ -588,7 +589,7 @@ def load_data() -> None:
         if support_rows:
             data["support"] = support_rows[0]
 
-        activity_logs = sb_select("tk_activity_logs", "order=id.desc&limit=800")
+        activity_logs = sb_select("tk_activity_logs", "limit=800")
         if activity_logs is not None:
             data["activity_logs"] = activity_logs
 
@@ -614,8 +615,9 @@ def load_data() -> None:
 
 
 def log_activity(user_id: int, username: str, action: str, details: str = "") -> None:
+    raw_uid = f"act_{uuid.uuid4().hex[:12]}"
     entry = {
-        "id": f"act_{uuid.uuid4().hex[:12]}",
+        "id": raw_uid,
         "user_id": int(user_id),
         "username": username or "",
         "action": action,
@@ -634,7 +636,12 @@ def log_activity(user_id: int, username: str, action: str, details: str = "") ->
         "action": f"{action}: {details}" if details else action,
         "created_at": entry["created_at"],
     }
-    sb_upsert("tk_activity_logs", sb_row, "id")
+    res = sb_upsert("tk_activity_logs", sb_row, "id")
+    if res is None:
+        # Запасной вариант, если в Supabase id всё ещё bigint
+        num_id = int(hashlib.sha256(raw_uid.encode("utf-8")).hexdigest()[:12], 16)
+        sb_row_num = dict(sb_row, id=num_id)
+        sb_upsert("tk_activity_logs", sb_row_num, "id")
 
 
 def touch_user(msg: types.Message) -> None:
@@ -660,7 +667,10 @@ def touch_user(msg: types.Message) -> None:
 
     if now_ts - LAST_SEEN_SYNC.get(uid, 0.0) > 60.0:
         LAST_SEEN_SYNC[uid] = now_ts
-        sb_upsert("tk_users", row, "user_id")
+        res = sb_upsert("tk_users", row, "user_id")
+        if res is None:
+            # Запасной вариант для схемы, где первичный ключ id хранит user_id
+            sb_upsert("tk_users", {"id": uid, **row}, "id")
 
 
 # =========================================================
@@ -989,6 +999,34 @@ def _store_card_bytes(
     return saved_local, storage_path
 
 
+def persist_media_card(card: dict) -> bool:
+    sync_local_from_memory()
+    if not SUPABASE_ENABLED:
+        return True
+    full_row = {
+        "id": str(card["id"]),
+        "title": str(card.get("title") or ""),
+        "category": str(card.get("category") or ""),
+        "photo_file_id": card.get("photo_file_id"),
+        "photo_path": card.get("photo_path"),
+        "storage_path": card.get("storage_path"),
+        "created_at": str(card.get("created_at") or now_str()),
+    }
+    res = sb_upsert("tk_media_cards", full_row, "id")
+    if res is not None:
+        return True
+    fallback_row = {
+        k: v
+        for k, v in full_row.items()
+        if k not in ("category", "storage_path")
+    }
+    res2 = sb_upsert("tk_media_cards", fallback_row, "id")
+    if res2 is not None:
+        return True
+    print(f"[WARN] persist_media_card failed for {card.get('id')}", flush=True)
+    return False
+
+
 def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) -> tuple[bool, dict | str]:
     lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
     if not lines:
@@ -1053,29 +1091,6 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
 
     log_activity(uid, username, "TTK_CREATE_TEXT", f"{title} [{category or 'без категории'}]")
     return True, card
-
-
-def persist_media_card(card: dict) -> None:
-    sync_local_from_memory()
-    full_row = {
-        "id": str(card["id"]),
-        "title": str(card.get("title") or ""),
-        "category": str(card.get("category") or ""),
-        "photo_file_id": card.get("photo_file_id"),
-        "photo_path": card.get("photo_path"),
-        "storage_path": card.get("storage_path"),
-        "created_at": str(card.get("created_at") or now_str()),
-    }
-    res = sb_upsert("tk_media_cards", full_row, "id")
-    if res is None:
-        fallback_row = {
-            k: v
-            for k, v in full_row.items()
-            if k not in ("category", "storage_path")
-        }
-        res2 = sb_upsert("tk_media_cards", fallback_row, "id")
-        if res2 is None:
-            print(f"[WARN] persist_media_card failed for {card.get('id')}", flush=True)
 
 
 def clean_existing_media_titles(uid: int, username: str) -> list[tuple[str, str]]:
@@ -2330,7 +2345,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.25] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.26] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
