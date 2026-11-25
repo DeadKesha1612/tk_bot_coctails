@@ -22,6 +22,9 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_ID_RAW = (os.getenv("ADMIN_ID") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
+DONATIONALERTS_URL = (
+    os.getenv("DONATIONALERTS_URL") or "https://www.donationalerts.com/r/your_link"
+).strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
@@ -38,19 +41,40 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # =========================================================
-# КНОПКИ И ТЕКСТЫ
+# КНОПКИ И СПИСКИ
 # =========================================================
-BTN_RECIPES = "🍸 Рецепты"
-BTN_DISHWARE = "🥃 Посуда"
+BTN_RECIPES = "рецепты"
+BTN_DISHWARE = "посуда"
+BTN_HELP = "помощь"
+BTN_USERS = "пользователи"
+BTN_SUPPORT = "поддержка"
+
+BTN_REC_AUTHOR = "авторские"
+BTN_REC_CLASSIC = "классические"
+BTN_REC_INFUSIONS = "наливки"
+BTN_REC_MENU = "коктейли меню"
+
 BTN_BULK_MEDIA = "📥 Массовая загрузка"
-BTN_MEDIA_LIST = "🖼 Карточки"
-BTN_LOGS = "📜 Логи"
-BTN_USERS = "👥 Пользователи"
-BTN_SUPPORT = "💬 Поддержка"
-BTN_HELP = "❓ Помощь"
+BTN_DISH_SUMMARY = "📊 Подсчёт остатков"
 BTN_BACK = "⬅️ Назад"
 BTN_DONE = "✅ Готово"
 BTN_CANCEL = "❌ Отмена"
+
+INITIAL_DISHWARE = [
+    ("Бокал Красный Винник", 24),
+    ("Бокал пивной 0.5", 60),
+    ("Бокал Рокс", 24),
+    ("Бокал Айфриш", 12),
+    ("Бокал 375", 24),
+    ("Бокал снифтер", 12),
+    ("Бокал аллегро", 12),
+    ("Бокал индеец", 6),
+    ("Бокал флютте", 12),
+    ("Графин 1л", 6),
+    ("Графин 1.5л", 6),
+    ("Бокал Кружка банка", 10),
+    ("Штоф 0.5", 6),
+]
 
 DATA_LOCK = threading.RLock()
 USER_STATES: dict[int, dict] = {}
@@ -61,7 +85,7 @@ DB: dict = {
     "dishware": [],
     "dishware_logs": [],
     "users": [],
-    "support": {"id": "main", "text": "Обратитесь к администратору."},
+    "support": {"id": "main", "text": DONATIONALERTS_URL},
     "activity_logs": [],
     "media_cards": [],
 }
@@ -83,7 +107,6 @@ def norm_text(value: str | None) -> str:
 
 
 def exact_title_from_message(msg: types.Message) -> str | None:
-    """Возвращает точное имя файла без расширения (или подпись), без изменений."""
     if msg.content_type == "document" and msg.document and msg.document.file_name:
         stem, _ = os.path.splitext(msg.document.file_name)
         if stem != "":
@@ -104,6 +127,17 @@ def is_admin(user_id: int) -> bool:
     return False
 
 
+def get_admin_ids() -> list[int]:
+    ids = set()
+    if ADMIN_ID:
+        ids.add(ADMIN_ID)
+    with DATA_LOCK:
+        for u in DB.get("users", []):
+            if bool(u.get("is_admin")) and u.get("user_id"):
+                ids.add(int(u["user_id"]))
+    return list(ids)
+
+
 def safe_send_text(chat_id: int, text: str, reply_markup=None):
     try:
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
@@ -112,26 +146,58 @@ def safe_send_text(chat_id: int, text: str, reply_markup=None):
         return None
 
 
-def safe_edit_text(chat_id: int, message_id: int, text: str, reply_markup=None):
-    try:
-        return bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id,
-            reply_markup=reply_markup,
-        )
-    except Exception as e:
-        print(f"[WARN] edit_message_text failed ({chat_id}/{message_id}): {e}", flush=True)
-        return None
-
-
+# =========================================================
+# КЛАВИАТУРЫ
+# =========================================================
 def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(types.KeyboardButton(BTN_RECIPES), types.KeyboardButton(BTN_DISHWARE))
-    kb.row(types.KeyboardButton(BTN_BULK_MEDIA), types.KeyboardButton(BTN_MEDIA_LIST))
+    kb.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_SUPPORT))
     if is_admin(user_id):
-        kb.row(types.KeyboardButton(BTN_LOGS), types.KeyboardButton(BTN_USERS))
-    kb.row(types.KeyboardButton(BTN_SUPPORT), types.KeyboardButton(BTN_HELP))
+        kb.row(types.KeyboardButton(BTN_USERS))
+    return kb
+
+
+def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_REC_AUTHOR), types.KeyboardButton(BTN_REC_CLASSIC))
+    kb.row(types.KeyboardButton(BTN_REC_INFUSIONS), types.KeyboardButton(BTN_REC_MENU))
+    if is_admin(user_id):
+        kb.row(types.KeyboardButton(BTN_BULK_MEDIA))
+    kb.row(types.KeyboardButton(BTN_BACK))
+    return kb
+
+
+def dishware_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    with DATA_LOCK:
+        items = list(DB.get("dishware", []))
+    for i in range(0, len(items), 2):
+        row = []
+        d1 = items[i]
+        row.append(types.KeyboardButton(f"{d1.get('name')} — {int(d1.get('qty') or 0)}шт"))
+        if i + 1 < len(items):
+            d2 = items[i + 1]
+            row.append(types.KeyboardButton(f"{d2.get('name')} — {int(d2.get('qty') or 0)}шт"))
+        kb.row(*row)
+    kb.row(types.KeyboardButton(BTN_DISH_SUMMARY))
+    if is_admin(user_id):
+        kb.row(types.KeyboardButton(BTN_BULK_MEDIA))
+    kb.row(types.KeyboardButton(BTN_BACK))
+    return kb
+
+
+def dishware_item_keyboard(item_name: str) -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("+1"), types.KeyboardButton("-1"))
+    kb.row(types.KeyboardButton("+5"), types.KeyboardButton("-5"))
+    kb.row(types.KeyboardButton(BTN_DISH_SUMMARY), types.KeyboardButton(BTN_BACK))
+    return kb
+
+
+def back_only_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton(BTN_BACK))
     return kb
 
 
@@ -194,10 +260,6 @@ def sb_upsert(table: str, row: dict, on_conflict: str = "id"):
     )
 
 
-def sb_delete(table: str, query: str):
-    return sb_request("DELETE", table, query=query)
-
-
 def sync_local_from_memory() -> None:
     try:
         snapshot = copy.deepcopy(DB)
@@ -207,13 +269,28 @@ def sync_local_from_memory() -> None:
         print(f"[WARN] sync_local_from_memory failed: {e}", flush=True)
 
 
+def seed_default_dishware_if_empty(data: dict) -> None:
+    if data.get("dishware"):
+        return
+    seeded = []
+    for idx, (name, qty) in enumerate(INITIAL_DISHWARE, start=1):
+        row = {
+            "id": f"dish_{idx:02d}",
+            "name": name,
+            "qty": int(qty),
+        }
+        seeded.append(row)
+        sb_upsert("tk_dishware", row, "id")
+    data["dishware"] = seeded
+
+
 def load_local_fallback() -> dict:
     fallback = {
         "recipes": [],
         "dishware": [],
         "dishware_logs": [],
         "users": [],
-        "support": {"id": "main", "text": "Обратитесь к администратору."},
+        "support": {"id": "main", "text": DONATIONALERTS_URL},
         "activity_logs": [],
         "media_cards": [],
     }
@@ -236,9 +313,11 @@ def load_data() -> None:
         if recipes is not None:
             data["recipes"] = recipes
 
-        dishware = sb_select("tk_dishware", "order=name.asc")
+        dishware = sb_select("tk_dishware", "order=id.asc")
         if dishware is not None:
             data["dishware"] = dishware
+
+        seed_default_dishware_if_empty(data)
 
         dishware_logs = sb_select("tk_dishware_logs", "order=id.desc&limit=500")
         if dishware_logs is not None:
@@ -320,6 +399,76 @@ def touch_user(msg: types.Message) -> None:
 
 
 # =========================================================
+# ПОСУДА
+# =========================================================
+def match_dishware_button(text: str) -> dict | None:
+    clean = re.sub(r"\s*—\s*\d+шт\s*$", "", (text or "").strip())
+    norm_clean = norm_text(clean)
+    if not norm_clean:
+        return None
+    with DATA_LOCK:
+        for d in DB.get("dishware", []):
+            if norm_text(d.get("name")) == norm_clean:
+                return d
+    return None
+
+
+def adjust_dishware_qty(item_id: str, delta: int | None, set_exact: int | None, uid: int, username: str) -> dict | None:
+    with DATA_LOCK:
+        items = DB.get("dishware", [])
+        target = next((d for d in items if str(d.get("id")) == str(item_id)), None)
+        if not target:
+            return None
+        old_qty = int(target.get("qty") or 0)
+        if set_exact is not None:
+            new_qty = max(0, int(set_exact))
+            diff = new_qty - old_qty
+        else:
+            diff = int(delta or 0)
+            new_qty = max(0, old_qty + diff)
+
+        target["qty"] = new_qty
+        sync_local_from_memory()
+        sb_upsert(
+            "tk_dishware",
+            {
+                "id": str(target["id"]),
+                "name": str(target.get("name") or ""),
+                "qty": new_qty,
+            },
+            "id",
+        )
+
+        dlog = {
+            "id": f"dlog_{uuid.uuid4().hex[:12]}",
+            "dishware_id": str(target["id"]),
+            "name": str(target.get("name") or ""),
+            "delta": diff,
+            "qty_after": new_qty,
+            "user_id": int(uid),
+            "username": username or "",
+            "created_at": now_str(),
+        }
+        DB.setdefault("dishware_logs", []).insert(0, dlog)
+        DB["dishware_logs"] = DB["dishware_logs"][:500]
+        sb_upsert("tk_dishware_logs", dlog, "id")
+
+    log_activity(uid, username, "DISHWARE_QTY", f"{target.get('name')}: {old_qty} -> {new_qty} ({diff:+d})")
+    return target
+
+
+def format_dishware_summary() -> str:
+    with DATA_LOCK:
+        items = list(DB.get("dishware", []))
+    if not items:
+        return "Посуды пока нет."
+    total_pcs = sum(int(d.get("qty") or 0) for d in items)
+    lines = [f"• {esc(d.get('name') or '')}: <b>{int(d.get('qty') or 0)}шт</b>" for d in items]
+    lines.append(f"\n<b>Итого позиций:</b> {len(items)} | <b>Всего штук:</b> {total_pcs}шт")
+    return "📊 <b>Подсчёт остатков посуды:</b>\n\n" + "\n".join(lines)
+
+
+# =========================================================
 # КАРТОЧКИ ФАЙЛОВ / PNG (tk_media_cards)
 # =========================================================
 def persist_media_card(card: dict) -> None:
@@ -338,7 +487,6 @@ def persist_media_card(card: dict) -> None:
 
 
 def save_incoming_media_card(msg: types.Message) -> tuple[bool, dict | str]:
-    """Сохраняет файл/PNG с точным именем файла (без расширения) в DB и Supabase."""
     exact_title = exact_title_from_message(msg)
     if not exact_title:
         return False, "Не удалось определить имя файла — отправьте PNG как файл/документ (или добавьте подпись)."
@@ -382,7 +530,6 @@ def save_incoming_media_card(msg: types.Message) -> tuple[bool, dict | str]:
 
     with DATA_LOCK:
         cards = DB.setdefault("media_cards", [])
-        # Если карточка с точно таким же title уже есть — обновляем её файл/file_id
         existing = next((c for c in cards if str(c.get("title") or "") == exact_title), None)
         if existing:
             existing["photo_file_id"] = card["photo_file_id"]
@@ -437,10 +584,84 @@ def find_media_matches(query: str) -> list[dict]:
 
 
 # =========================================================
-# ПОИСК И КОМАНДЫ БОТА
+# РЕЦЕПТЫ, ПОМОЩЬ, ПОЛЬЗОВАТЕЛИ, ПОДДЕРЖКА
 # =========================================================
+def show_recipe_category(msg: types.Message, category_key: str) -> None:
+    uid = msg.from_user.id
+    with DATA_LOCK:
+        recipes = [
+            r for r in DB.get("recipes", [])
+            if norm_text(r.get("category") or r.get("type") or "") == norm_text(category_key)
+        ]
+    if not recipes:
+        safe_send_text(
+            msg.chat.id,
+            f"Раздел <b>{esc(category_key)}</b> пока пуст.",
+            reply_markup=recipes_menu_keyboard(uid),
+        )
+        return
+    lines = [f"• <b>{esc(r.get('name') or r.get('title') or 'Без названия')}</b>" for r in recipes[:40]]
+    safe_send_text(
+        msg.chat.id,
+        f"🍸 <b>{esc(category_key)}</b> ({len(recipes)}):\n\n" + "\n".join(lines),
+        reply_markup=recipes_menu_keyboard(uid),
+    )
+
+
+def show_users_and_actions(msg: types.Message) -> None:
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+        return
+    with DATA_LOCK:
+        users = list(DB.get("users", []))[:20]
+        logs = list(DB.get("activity_logs", []))[:25]
+
+    user_lines = []
+    for u in users:
+        uname = f"@{u.get('username')}" if u.get("username") else "без username"
+        name = u.get("first_name") or ""
+        user_lines.append(
+            f"• {esc(name)} ({esc(uname)}, id <code>{esc(u.get('user_id'))}</code>) — {esc(u.get('last_seen') or '')}"
+        )
+
+    action_lines = []
+    for a in logs:
+        act_user = f"@{a.get('username')}" if a.get("username") else f"id {a.get('user_id')}"
+        details = f" — {a.get('details')}" if a.get("details") else ""
+        action_lines.append(
+            f"• [{esc(a.get('created_at') or '')}] {esc(act_user)}: <b>{esc(a.get('action') or '')}</b>{esc(details)}"
+        )
+
+    text = (
+        "👥 <b>Пользователи:</b>\n"
+        + ("\n".join(user_lines) if user_lines else "Пока нет")
+        + "\n\n📜 <b>Последние действия:</b>\n"
+        + ("\n".join(action_lines) if action_lines else "Пока нет")
+    )
+    safe_send_text(msg.chat.id, text[:4000], reply_markup=back_only_keyboard())
+
+
+def send_support_link(msg: types.Message) -> None:
+    uid = msg.from_user.id
+    with DATA_LOCK:
+        sup_raw = str((DB.get("support") or {}).get("text") or "").strip()
+    url = sup_raw if sup_raw.startswith(("http://", "https://")) else DONATIONALERTS_URL
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("💛 Поддержать на DonationAlerts", url=url))
+    safe_send_text(
+        msg.chat.id,
+        f"💛 <b>Поддержка проекта</b>\nСсылка: {esc(url)}",
+        reply_markup=kb,
+    )
+    safe_send_text(msg.chat.id, "Нажми кнопку выше или выбери раздел:", reply_markup=main_menu_keyboard(uid))
+
+
 def start_bulk_mode(msg: types.Message) -> None:
     uid = msg.from_user.id
+    if not is_admin(uid):
+        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+        return
     USER_STATES[uid] = {"mode": "media_bulk_add", "count": 0, "titles": []}
     safe_send_text(
         msg.chat.id,
@@ -468,16 +689,19 @@ def finish_bulk_mode(msg: types.Message) -> None:
     )
 
 
-@bot.message_handler(commands=["start", "help"])
+# =========================================================
+# ОБРАБОТЧИКИ TELEGRAM
+# =========================================================
+@bot.message_handler(commands=["start"])
 def cmd_start(msg: types.Message):
     touch_user(msg)
-    USER_STATES.pop(msg.from_user.id, None)
+    uid = msg.from_user.id
+    USER_STATES.pop(uid, None)
+    log_activity(uid, msg.from_user.username or "", "START")
     safe_send_text(
         msg.chat.id,
-        "Привет! Бот готов к работе.\n"
-        "• Напиши любое название — найду в карточках/рецептах/посуде.\n"
-        "• Нажми <b>📥 Массовая загрузка</b> или отправь <code>/bulk</code> для загрузки пачки PNG/файлов.",
-        reply_markup=main_menu_keyboard(msg.from_user.id),
+        "Привет! Выбери раздел в меню или напиши название для поиска.",
+        reply_markup=main_menu_keyboard(uid),
     )
 
 
@@ -522,7 +746,9 @@ def handle_media_upload(msg: types.Message):
 def handle_text(msg: types.Message):
     touch_user(msg)
     uid = msg.from_user.id
+    username = msg.from_user.username or ""
     text = (msg.text or "").strip()
+    low = norm_text(text)
     st = USER_STATES.get(uid) or {}
 
     if st.get("mode") == "media_bulk_add":
@@ -531,7 +757,7 @@ def handle_text(msg: types.Message):
             return
         if text == BTN_CANCEL:
             USER_STATES.pop(uid, None)
-            safe_send_text(msg.chat.id, "❌ Режим массовой загрузки отменён.", reply_markup=main_menu_keyboard(uid))
+            safe_send_text(msg.chat.id, "❌ Загрузка отменена.", reply_markup=main_menu_keyboard(uid))
             return
         safe_send_text(
             msg.chat.id,
@@ -540,61 +766,128 @@ def handle_text(msg: types.Message):
         )
         return
 
+    if st.get("mode") == "help_wait_text":
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+            return
+        USER_STATES.pop(uid, None)
+        log_activity(uid, username, "HELP_REQUEST", text[:200])
+        admins = get_admin_ids()
+        sender_label = f"@{username}" if username else f"id {uid}"
+        report = (
+            f"🆘 <b>Запрос в помощь</b>\n"
+            f"От: {esc(msg.from_user.first_name or '')} ({esc(sender_label)}, <code>{uid}</code>)\n\n"
+            f"{esc(text)}"
+        )
+        for aid in admins:
+            if aid != uid:
+                safe_send_text(aid, report)
+        if uid in admins:
+            safe_send_text(uid, report)
+        safe_send_text(
+            msg.chat.id,
+            "✅ Запрос отправлен администратору. Спасибо!",
+            reply_markup=main_menu_keyboard(uid),
+        )
+        return
+
+    if st.get("mode") == "dishware_item":
+        item_id = st.get("item_id")
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "Раздел «посуда»:", reply_markup=dishware_menu_keyboard(uid))
+            return
+        if text == BTN_DISH_SUMMARY:
+            safe_send_text(msg.chat.id, format_dishware_summary(), reply_markup=dishware_item_keyboard(st.get("name") or ""))
+            return
+        delta = None
+        exact = None
+        if text in ("+1", "-1", "+5", "-5"):
+            delta = int(text)
+        elif re.fullmatch(r"[+-]\d+", text):
+            delta = int(text)
+        elif re.fullmatch(r"\d+", text):
+            exact = int(text)
+
+        if delta is not None or exact is not None:
+            updated = adjust_dishware_qty(item_id, delta, exact, uid, username)
+            if updated:
+                st["name"] = updated.get("name") or ""
+                safe_send_text(
+                    msg.chat.id,
+                    f"🥃 <b>{esc(updated.get('name'))}</b>: <b>{int(updated.get('qty') or 0)}шт</b>",
+                    reply_markup=dishware_item_keyboard(st["name"]),
+                )
+            return
+
+    if text == BTN_BACK:
+        USER_STATES.pop(uid, None)
+        safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+        return
+
     if text == BTN_BULK_MEDIA:
         start_bulk_mode(msg)
         return
 
-    if text == BTN_MEDIA_LIST:
-        with DATA_LOCK:
-            cards = list(DB.get("media_cards", []))
-        if not cards:
-            safe_send_text(msg.chat.id, "Сохранённых карточек пока нет.", reply_markup=main_menu_keyboard(uid))
-            return
-        lines = [f"• {esc(c.get('title') or '')}" for c in cards[:50]]
+    if low == BTN_RECIPES:
+        log_activity(uid, username, "OPEN_RECIPES")
+        safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
+        return
+
+    if low in (BTN_REC_AUTHOR, BTN_REC_CLASSIC, BTN_REC_INFUSIONS, BTN_REC_MENU):
+        log_activity(uid, username, "RECIPES_CAT", low)
+        show_recipe_category(msg, low)
+        return
+
+    if low == BTN_DISHWARE:
+        USER_STATES.pop(uid, None)
+        log_activity(uid, username, "OPEN_DISHWARE")
+        safe_send_text(msg.chat.id, "🥃 Выбери позицию посуды:", reply_markup=dishware_menu_keyboard(uid))
+        return
+
+    if text == BTN_DISH_SUMMARY:
+        log_activity(uid, username, "DISHWARE_SUMMARY")
+        safe_send_text(msg.chat.id, format_dishware_summary(), reply_markup=dishware_menu_keyboard(uid))
+        return
+
+    matched_dish = match_dishware_button(text)
+    if matched_dish:
+        USER_STATES[uid] = {
+            "mode": "dishware_item",
+            "item_id": matched_dish.get("id"),
+            "name": matched_dish.get("name"),
+        }
         safe_send_text(
             msg.chat.id,
-            f"🖼 <b>Карточки ({len(cards)}):</b>\n\n" + "\n".join(lines),
-            reply_markup=main_menu_keyboard(uid),
+            f"🥃 <b>{esc(matched_dish.get('name'))}</b> — сейчас <b>{int(matched_dish.get('qty') or 0)}шт</b>.\n"
+            "Нажми <b>+1 / -1 / +5 / -5</b> или отправь число (например, <code>+10</code>, <code>-3</code> или <code>24</code>).",
+            reply_markup=dishware_item_keyboard(matched_dish.get("name") or ""),
         )
         return
 
-    if text == BTN_HELP:
+    if low == BTN_HELP:
+        USER_STATES[uid] = {"mode": "help_wait_text"}
         safe_send_text(
             msg.chat.id,
-            "• Нажми <b>📥 Массовая загрузка</b> и отправь файлы PNG — бот запишет точное имя файла без расширения.\n"
-            "• Напиши название текстом — бот отправит название и прикреплённый файл/PNG.",
-            reply_markup=main_menu_keyboard(uid),
+            "🆘 Опиши проблему текстом и отправь сообщение — я передам его администратору.",
+            reply_markup=back_only_keyboard(),
         )
         return
 
-    if text == BTN_SUPPORT:
-        with DATA_LOCK:
-            sup_text = str((DB.get("support") or {}).get("text") or "Обратитесь к администратору.")
-        safe_send_text(msg.chat.id, f"💬 <b>Поддержка:</b>\n{esc(sup_text)}", reply_markup=main_menu_keyboard(uid))
+    if low == BTN_USERS:
+        log_activity(uid, username, "OPEN_USERS")
+        show_users_and_actions(msg)
         return
 
-    if text == BTN_RECIPES:
-        with DATA_LOCK:
-            recipes = list(DB.get("recipes", []))
-        if not recipes:
-            safe_send_text(msg.chat.id, "Рецептов пока нет.", reply_markup=main_menu_keyboard(uid))
-            return
-        names = "\n".join(f"• {esc(r.get('name') or r.get('title') or 'Без названия')}" for r in recipes[:50])
-        safe_send_text(msg.chat.id, f"🍸 <b>Рецепты:</b>\n\n{names}", reply_markup=main_menu_keyboard(uid))
-        return
-
-    if text == BTN_DISHWARE:
-        with DATA_LOCK:
-            dishware = list(DB.get("dishware", []))
-        if not dishware:
-            safe_send_text(msg.chat.id, "Посуды пока нет.", reply_markup=main_menu_keyboard(uid))
-            return
-        lines = [f"• {esc(d.get('name') or '')}: {esc(d.get('qty') or 0)}" for d in dishware[:50]]
-        safe_send_text(msg.chat.id, f"🥃 <b>Посуда:</b>\n\n{lines}", reply_markup=main_menu_keyboard(uid))
+    if low == BTN_SUPPORT:
+        log_activity(uid, username, "OPEN_SUPPORT")
+        send_support_link(msg)
         return
 
     # Текстовый поиск по сохранённым карточкам
     print(f"[TEXT_SEARCH] uid={uid} query={text!r}", flush=True)
+    log_activity(uid, username, "SEARCH", text[:120])
     matches = find_media_matches(text)
     if matches:
         for card in matches[:5]:
@@ -629,7 +922,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.4] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
+    print(f"[NEW BUILD v10.6] Запуск бота (supabase: {SUPABASE_ENABLED})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
