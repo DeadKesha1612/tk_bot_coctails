@@ -532,7 +532,15 @@ def log_activity(user_id: int, username: str, action: str, details: str = "") ->
         DB.setdefault("activity_logs", []).insert(0, entry)
         DB["activity_logs"] = DB["activity_logs"][:800]
         sync_local_from_memory()
-    sb_upsert("tk_activity_logs", entry, "id")
+
+    sb_row = {
+        "id": entry["id"],
+        "user_id": entry["user_id"],
+        "username": entry["username"],
+        "action": f"{action}: {details}" if details else action,
+        "created_at": entry["created_at"],
+    }
+    sb_upsert("tk_activity_logs", sb_row, "id")
 
 
 def touch_user(msg: types.Message) -> None:
@@ -2010,7 +2018,7 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.20] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(f"[NEW BUILD v10.21] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
