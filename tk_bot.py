@@ -64,6 +64,7 @@ BTN_DISHWARE = "🥃 Посуда"
 BTN_HELP = "🆘 Помощь"
 BTN_USERS = "👥 Пользователи"
 BTN_SUPPORT = "💛 Поддержка"
+BTN_SUGGEST_COCKTAIL = "💡 Предложить коктейль"
 
 BTN_REC_AUTHOR = "✨ Авторские"
 BTN_REC_CLASSIC = "🥃 Классические"
@@ -92,6 +93,8 @@ BTN_TTK_PREV = "⬅️ Пред."
 
 CB_CARD_PREFIX = "c:"
 CB_PAGE_PREFIX = "p:"
+CB_SUG_APPROVE_PREFIX = "sa:"
+CB_SUG_REJECT_PREFIX = "sr:"
 
 CAT_CODES = {
     "": "all",
@@ -131,6 +134,7 @@ DATA_LOCK = threading.RLock()
 USER_STATES: dict[int, dict] = {}
 LAST_SEEN_SYNC: dict[int, float] = {}
 CALLBACK_CARD_MAP: dict[str, str] = {}
+SUGGESTIONS_STORE: dict[str, dict] = {}
 
 DB: dict = {
     "recipes": [],
@@ -201,6 +205,18 @@ def is_admin(user_id: int) -> bool:
     return False
 
 
+def require_admin_msg(msg: types.Message) -> bool:
+    uid = msg.from_user.id if msg.from_user else 0
+    if is_admin(uid):
+        return True
+    safe_send_text(
+        msg.chat.id,
+        "⛔ Это действие доступно только администратору. Ты можешь нажать «💡 Предложить коктейль».",
+        reply_markup=main_menu_keyboard(uid),
+    )
+    return False
+
+
 def get_admin_ids() -> list[int]:
     ids = set()
     if ADMIN_ID:
@@ -254,10 +270,10 @@ def parse_number_selection(raw: str, max_index: int) -> list[int]:
 # =========================================================
 def main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton(BTN_RECIPES), types.KeyboardButton(BTN_DISHWARE))
-    kb.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_SUPPORT))
+    kb.row(types.KeyboardButton(BTN_RECIPES), types.KeyboardButton(BTN_SUGGEST_COCKTAIL))
     if is_admin(user_id):
-        kb.row(types.KeyboardButton(BTN_USERS))
+        kb.row(types.KeyboardButton(BTN_DISHWARE), types.KeyboardButton(BTN_USERS))
+    kb.row(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_SUPPORT))
     return kb
 
 
@@ -266,10 +282,10 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     kb.row(types.KeyboardButton(BTN_REC_AUTHOR), types.KeyboardButton(BTN_REC_CLASSIC))
     kb.row(types.KeyboardButton(BTN_REC_INFUSIONS), types.KeyboardButton(BTN_REC_MENU))
     kb.row(types.KeyboardButton(BTN_REC_PREMIXES), types.KeyboardButton(BTN_MEDIA_LIST))
-    kb.row(types.KeyboardButton(BTN_ADD_TTK_TEXT))
+    kb.row(types.KeyboardButton(BTN_SUGGEST_COCKTAIL))
     if is_admin(user_id):
-        kb.row(types.KeyboardButton(BTN_MANAGE_TTK), types.KeyboardButton(BTN_BULK_MEDIA))
-        kb.row(types.KeyboardButton(BTN_CLEAN_TITLES))
+        kb.row(types.KeyboardButton(BTN_ADD_TTK_TEXT), types.KeyboardButton(BTN_MANAGE_TTK))
+        kb.row(types.KeyboardButton(BTN_BULK_MEDIA), types.KeyboardButton(BTN_CLEAN_TITLES))
     kb.row(types.KeyboardButton(BTN_BACK))
     return kb
 
@@ -314,6 +330,15 @@ def ttk_popup_keyboard(page_cards: list[dict], page: int, total_pages: int, cat_
             types.InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"{CB_PAGE_PREFIX}{next_page}:{cat_code}")
         )
         kb.row(*nav_buttons)
+    return kb
+
+
+def suggestion_review_keyboard(suggestion_id: str) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton("✅ Добавить", callback_data=f"{CB_SUG_APPROVE_PREFIX}{suggestion_id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"{CB_SUG_REJECT_PREFIX}{suggestion_id}"),
+    )
     return kb
 
 
@@ -753,7 +778,7 @@ def format_dishware_summary() -> str:
 
 
 # =========================================================
-# ТТК / КАРТОЧКИ + ОФОРМЛЕНИЕ ТТК В PNG (tk_media_cards)
+# ТТК / КАРТОЧКИ + ПОДСЧЁТ ВЫХОДА + PNG (tk_media_cards)
 # =========================================================
 def _download_font_if_needed(target_path: str, urls: list[str]) -> str | None:
     if os.path.isfile(target_path) and os.path.getsize(target_path) > 10000:
@@ -836,6 +861,74 @@ def load_ttk_card_fonts():
     }
 
 
+def _parse_qty_value_and_unit(qty_str: str) -> tuple[float | None, str | None]:
+    q = (qty_str or "").strip().lower().replace(",", ".")
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(мл|л|г|гр|кг|шт)$", q)
+    if not m:
+        return None, None
+    val = float(m.group(1))
+    unit = m.group(2)
+    if unit == "л":
+        return val * 1000.0, "мл"
+    if unit in ("г", "гр"):
+        return val, "г"
+    if unit == "кг":
+        return val * 1000.0, "г"
+    if unit == "мл":
+        return val, "мл"
+    if unit == "шт":
+        return val, "шт"
+    return None, None
+
+
+def _format_number_clean(num: float) -> str:
+    if abs(num - round(num)) < 1e-6:
+        return str(int(round(num)))
+    return f"{num:.1f}".rstrip("0").rstrip(".")
+
+
+def _compute_output_row(ingredients: list[tuple[str, str]]) -> tuple[str, str] | None:
+    if not ingredients:
+        return None
+
+    for name, qty in ingredients:
+        if norm_text(name).startswith("выход") or norm_text(qty).startswith("выход"):
+            return None
+
+    vol_ml = 0.0
+    mass_g = 0.0
+    pcs_cnt = 0.0
+
+    for _, qty in ingredients:
+        val, kind = _parse_qty_value_and_unit(qty)
+        if val is None or not kind:
+            continue
+        if kind == "мл":
+            vol_ml += val
+        elif kind == "г":
+            mass_g += val
+        elif kind == "шт":
+            pcs_cnt += val
+
+    parts: list[str] = []
+    if vol_ml > 0:
+        if vol_ml >= 1000 and abs((vol_ml / 1000.0) - round(vol_ml / 1000.0, 2)) < 1e-6:
+            parts.append(f"{_format_number_clean(vol_ml)} мл ({_format_number_clean(vol_ml / 1000.0)} л)")
+        else:
+            parts.append(f"{_format_number_clean(vol_ml)} мл")
+    if mass_g > 0:
+        if mass_g >= 1000:
+            parts.append(f"{_format_number_clean(mass_g)} г ({_format_number_clean(mass_g / 1000.0)} кг)")
+        else:
+            parts.append(f"{_format_number_clean(mass_g)} г")
+    if pcs_cnt > 0 and not parts:
+        parts.append(f"{_format_number_clean(pcs_cnt)} шт")
+
+    if not parts:
+        return None
+    return ("Выход готового напитка", " + ".join(parts))
+
+
 def _split_ingredient_line_or_clause(raw_item: str) -> tuple[str, str]:
     s = re.sub(r"\s+", " ", (raw_item or "").strip(" •-–—;"))
     if not s:
@@ -867,7 +960,6 @@ def _parse_ingredient_chunk(ing_chunk: str) -> list[tuple[str, str]]:
             continue
         if re.match(r"^(состав|ингредиенты)[:：]?$", norm_text(clean_line)):
             continue
-        # Поддерживаем перечисление ингредиентов через запятую или точку с запятой в одной строке
         parts = [p.strip() for p in re.split(r"[,;]+", clean_line) if p.strip()]
         for part in parts:
             name, qty = _split_ingredient_line_or_clause(part)
@@ -881,7 +973,6 @@ def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str
     if not raw_text:
         return [], [title]
 
-    # Проверяем явные заголовки "Состав:" и "Приготовление:"
     m_prep_marker = re.search(
         r"(?im)^(?:приготовление|способ приготовления|метод|описание)\s*[:：—–-]?\s*(.*)$",
         raw_text,
@@ -893,35 +984,30 @@ def _parse_ttk_sections(title: str, body_text: str) -> tuple[list[tuple[str, str
         prep_combined = "\n".join(x for x in (first_prep_line, rest_prep) if x)
         ingredients = _parse_ingredient_chunk(comp_part)
         prep_lines = [ln.strip() for ln in prep_combined.splitlines() if ln.strip()]
-        if not prep_lines and title:
-            prep_lines = [title]
-        return ingredients, prep_lines
-
-    # Формат через пустую строку:
-    # параграф 1 — состав, параграф 2 (после пустой строки) — метод приготовления
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", raw_text) if p.strip()]
-    if len(paragraphs) >= 2:
-        comp_block = "\n".join(paragraphs[:-1])
-        prep_block = paragraphs[-1]
-        ingredients = _parse_ingredient_chunk(comp_block)
-        prep_lines = [ln.strip() for ln in prep_block.splitlines() if ln.strip()]
-        if ingredients:
-            return ingredients, prep_lines
-
-    # Однострочный или слитный блок без пустых строк:
-    # если есть запятые/количества — в состав, остальное — в приготовление
-    ingredients: list[tuple[str, str]] = []
-    prep_lines: list[str] = []
-    for ln in raw_text.splitlines():
-        clean = ln.strip()
-        if not clean:
-            continue
-        parsed_here = _parse_ingredient_chunk(clean)
-        has_qty_or_list = any(q for _, q in parsed_here) or ("," in clean and len(clean) <= 140)
-        if has_qty_or_list and not prep_lines:
-            ingredients.extend(parsed_here)
+    else:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", raw_text) if p.strip()]
+        if len(paragraphs) >= 2:
+            comp_block = "\n".join(paragraphs[:-1])
+            prep_block = paragraphs[-1]
+            ingredients = _parse_ingredient_chunk(comp_block)
+            prep_lines = [ln.strip() for ln in prep_block.splitlines() if ln.strip()]
         else:
-            prep_lines.append(clean)
+            ingredients = []
+            prep_lines = []
+            for ln in raw_text.splitlines():
+                clean = ln.strip()
+                if not clean:
+                    continue
+                parsed_here = _parse_ingredient_chunk(clean)
+                has_qty_or_list = any(q for _, q in parsed_here) or ("," in clean and len(clean) <= 140)
+                if has_qty_or_list and not prep_lines:
+                    ingredients.extend(parsed_here)
+                else:
+                    prep_lines.append(clean)
+
+    output_row = _compute_output_row(ingredients)
+    if output_row:
+        ingredients.append(output_row)
 
     if not ingredients and not prep_lines:
         prep_lines.append(title)
@@ -947,8 +1033,6 @@ def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
             blocks.append(clean_chunk)
             continue
 
-        # Когда в одном тексте подряд идут несколько позиций формата:
-        # [Название] -> [Состав] -> [Приготовление] -> [Следующее название] -> ...
         i = 0
         while i < len(paras):
             title_p = paras[i]
@@ -962,7 +1046,6 @@ def _split_multi_ttk_blocks(raw_text: str) -> list[str]:
             if looks_like_title and i + 2 < len(paras):
                 comp_p = paras[i + 1]
                 prep_p = paras[i + 2]
-                # Если через ещё один параграф идёт новый заголовок, группируем тройку
                 if i + 3 < len(paras):
                     next_first = paras[i + 3].splitlines()[0].strip()
                     next_is_title = (
@@ -1000,17 +1083,19 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     inner_x0 = pad_x + 44
     inner_x1 = canvas_w - pad_x - 44
     inner_w = inner_x1 - inner_x0
+    measure_draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
 
     title_lines = textwrap.wrap(title.upper(), width=34) or [title.upper()]
 
-    wrapped_ing: list[tuple[str, str]] = []
+    wrapped_ing: list[tuple[str, str, bool]] = []
     for name, qty in ingredients:
-        max_name_w = int(inner_w * 0.72) if qty else inner_w
+        is_output_row = norm_text(name).startswith("выход")
+        max_name_w = int(inner_w * 0.62) if qty else inner_w
         wrapped_name = []
         cur = ""
         for word in name.split():
             trial = f"{cur} {word}".strip()
-            if _text_width(draw_tmp := ImageDraw.Draw(Image.new("RGB", (10, 10))), trial, fonts["item"]) <= max_name_w:
+            if _text_width(measure_draw, trial, fonts["item_bold" if is_output_row else "item"]) <= max_name_w:
                 cur = trial
             else:
                 if cur:
@@ -1019,14 +1104,14 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
         if cur:
             wrapped_name.append(cur)
         for idx, w_line in enumerate(wrapped_name or [name]):
-            wrapped_ing.append((w_line, qty if idx == 0 else ""))
+            wrapped_ing.append((w_line, qty if idx == 0 else "", is_output_row))
 
     wrapped_prep: list[str] = []
     for p_line in prep_lines:
         cur = ""
         for word in p_line.split():
             trial = f"{cur} {word}".strip()
-            if _text_width(ImageDraw.Draw(Image.new("RGB", (10, 10))), trial, fonts["prep"]) <= inner_w:
+            if _text_width(measure_draw, trial, fonts["prep"]) <= inner_w:
                 cur = trial
             else:
                 if cur:
@@ -1049,7 +1134,6 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     card_y1 = total_h - pad_y
 
     draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=26, fill=(248, 249, 251))
-    # Акцентная верхняя полоса карточки
     draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y0 + 10], radius=5, fill=(217, 119, 6))
 
     y = card_y0 + 30
@@ -1071,16 +1155,19 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
         draw.text((inner_x0, sy), "СОСТАВ", fill=(17, 24, 39), font=fonts["sec_head"])
         sy += 38
 
-        for idx, (ing_name, ing_qty) in enumerate(wrapped_ing):
-            is_vykhod = norm_text(ing_name).startswith("выход")
-            n_font = fonts["item_bold"] if is_vykhod else fonts["item"]
+        for idx, (ing_name, ing_qty, is_output_row) in enumerate(wrapped_ing):
+            if is_output_row:
+                draw.line([(inner_x0, sy - 6), (inner_x1, sy - 6)], fill=(203, 213, 225), width=2)
+            n_font = fonts["item_bold"] if is_output_row else fonts["item"]
             q_font = fonts["item_bold"]
-            draw.text((inner_x0, sy), ing_name, fill=(30, 41, 59), font=n_font)
+            n_color = (180, 83, 9) if is_output_row else (30, 41, 59)
+            q_color = (180, 83, 9) if is_output_row else (15, 23, 42)
+            draw.text((inner_x0, sy), ing_name, fill=n_color, font=n_font)
             if ing_qty:
                 qw = _text_width(draw, ing_qty, q_font)
-                draw.text((inner_x1 - qw, sy), ing_qty, fill=(15, 23, 42), font=q_font)
+                draw.text((inner_x1 - qw, sy), ing_qty, fill=q_color, font=q_font)
             sy += 34
-            if idx < len(wrapped_ing) - 1 and ing_qty:
+            if idx < len(wrapped_ing) - 1 and ing_qty and not is_output_row:
                 draw.line([(inner_x0, sy + 3), (inner_x1, sy + 3)], fill=(241, 245, 249), width=1)
             sy += 10
 
@@ -1667,10 +1754,9 @@ def show_ttk_popup_page(
 
 
 def ask_manage_tab(msg: types.Message) -> None:
-    uid = msg.from_user.id
-    if not is_admin(uid):
-        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+    if not require_admin_msg(msg):
         return
+    uid = msg.from_user.id
     USER_STATES[uid] = {"mode": "ttk_choose_tab"}
     safe_send_text(
         msg.chat.id,
@@ -1681,10 +1767,9 @@ def ask_manage_tab(msg: types.Message) -> None:
 
 
 def show_ttk_manage_page(msg: types.Message, page: int = 0, manage_key: str = "__all__") -> None:
-    uid = msg.from_user.id
-    if not is_admin(uid):
-        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+    if not require_admin_msg(msg):
         return
+    uid = msg.from_user.id
 
     cards = _get_manage_tab_cards(manage_key)
     tab_label = _manage_tab_label(manage_key)
@@ -1727,6 +1812,8 @@ def show_ttk_manage_page(msg: types.Message, page: int = 0, manage_key: str = "_
 
 
 def open_ttk_card_actions(msg: types.Message, card: dict, manage_key: str = "__all__", page: int = 0) -> None:
+    if not require_admin_msg(msg):
+        return
     uid = msg.from_user.id
     USER_STATES[uid] = {
         "mode": "ttk_card_actions",
@@ -1742,6 +1829,76 @@ def open_ttk_card_actions(msg: types.Message, card: dict, manage_key: str = "__a
         "Выбери действие:",
         reply_markup=ttk_edit_keyboard(),
     )
+
+
+# =========================================================
+# ПРЕДЛОЖЕНИЯ КОКТЕЙЛЕЙ ОТ ПОЛЬЗОВАТЕЛЕЙ
+# =========================================================
+def submit_cocktail_suggestion(msg: types.Message, raw_text: str, category: str = "авторские") -> tuple[bool, str]:
+    user = msg.from_user
+    uid = int(user.id) if user else 0
+    username = (user.username or "") if user else ""
+    first_name = (user.first_name or "") if user else ""
+
+    blocks = _split_multi_ttk_blocks(raw_text)
+    if not blocks:
+        return False, "Текст пуст — укажи название, состав и метод приготовления."
+
+    first_block = blocks[0]
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", first_block) if p.strip()]
+    if len(paras) >= 2 and len(paras[0].splitlines()) == 1 and len(paras[0]) <= 80:
+        title = clean_uploaded_title(paras[0]) or paras[0]
+    else:
+        lines = [ln.strip() for ln in first_block.splitlines() if ln.strip()]
+        title = clean_uploaded_title(lines[0]) if lines else "Новый коктейль"
+
+    ing_preview, prep_preview = _parse_ttk_sections(title, first_block)
+    total_line = next((q for n, q in ing_preview if norm_text(n).startswith("выход")), "")
+
+    sug_id = f"sug_{uuid.uuid4().hex[:10]}"
+    SUGGESTIONS_STORE[sug_id] = {
+        "id": sug_id,
+        "raw_text": raw_text.strip(),
+        "title": title,
+        "category": category,
+        "author_id": uid,
+        "author_username": username,
+        "author_name": first_name,
+        "status": "pending",
+        "created_at": now_str(),
+    }
+
+    log_activity(uid, username, "SUGGEST_COCKTAIL", f"{title} [{category}]")
+
+    sender_tag = f"@{username}" if username else f"id {uid}"
+    ing_formatted = "\n".join(
+        f"  • {esc(n)}" + (f" — <b>{esc(q)}</b>" if q else "")
+        for n, q in ing_preview
+        if not norm_text(n).startswith("выход")
+    )
+    out_text = f"\n<b>Итоговый выход:</b> {esc(total_line)}" if total_line else ""
+    prep_text = "\n".join(f"  {esc(p)}" for p in prep_preview)
+
+    admin_msg = (
+        f"💡 <b>Предложен новый коктейль</b>\n"
+        f"От: {esc(first_name)} ({esc(sender_tag)}, <code>{uid}</code>)\n"
+        f"Вкладка: <b>{esc(category or 'без категории')}</b>\n\n"
+        f"<b>Название:</b> {esc(title)}\n"
+        f"<b>Состав:</b>\n{ing_formatted or '  —'}{out_text}\n"
+        f"<b>Приготовление:</b>\n{prep_text or '  —'}"
+    )
+
+    admins = get_admin_ids()
+    notified = 0
+    for aid in admins:
+        sent = bot.send_message(aid, admin_msg, reply_markup=suggestion_review_keyboard(sug_id))
+        if sent:
+            notified += 1
+
+    if notified == 0:
+        print(f"[WARN] No admin chat available for suggestion {sug_id}", flush=True)
+
+    return True, title
 
 
 # =========================================================
@@ -1765,11 +1922,10 @@ def show_media_cards_list(msg: types.Message, page: int = 0) -> None:
 
 
 def run_clean_titles_report(msg: types.Message) -> None:
+    if not require_admin_msg(msg):
+        return
     uid = msg.from_user.id
     username = msg.from_user.username or ""
-    if not is_admin(uid):
-        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
-        return
 
     changed = clean_existing_media_titles(uid, username)
     if not changed:
@@ -1790,9 +1946,7 @@ def run_clean_titles_report(msg: types.Message) -> None:
 
 
 def show_users_and_actions(msg: types.Message) -> None:
-    uid = msg.from_user.id
-    if not is_admin(uid):
-        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+    if not require_admin_msg(msg):
         return
     with DATA_LOCK:
         users = list(DB.get("users", []))[:20]
@@ -1838,10 +1992,9 @@ def send_support_link(msg: types.Message) -> None:
 
 
 def ask_bulk_category(msg: types.Message) -> None:
-    uid = msg.from_user.id
-    if not is_admin(uid):
-        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+    if not require_admin_msg(msg):
         return
+    uid = msg.from_user.id
     USER_STATES[uid] = {"mode": "bulk_choose_cat"}
     safe_send_text(
         msg.chat.id,
@@ -1851,10 +2004,9 @@ def ask_bulk_category(msg: types.Message) -> None:
 
 
 def start_bulk_mode(msg: types.Message, active_category: str = "") -> None:
-    uid = msg.from_user.id
-    if not is_admin(uid):
-        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+    if not require_admin_msg(msg):
         return
+    uid = msg.from_user.id
     USER_STATES[uid] = {
         "mode": "media_bulk_add",
         "count": 0,
@@ -1893,11 +2045,84 @@ def finish_bulk_mode(msg: types.Message) -> None:
 # =========================================================
 # ОБРАБОТЧИКИ TELEGRAM
 # =========================================================
-@bot.callback_query_handler(func=lambda call: call.data and (call.data.startswith(CB_CARD_PREFIX) or call.data.startswith(CB_PAGE_PREFIX)))
+@bot.callback_query_handler(
+    func=lambda call: call.data
+    and (
+        call.data.startswith(CB_CARD_PREFIX)
+        or call.data.startswith(CB_PAGE_PREFIX)
+        or call.data.startswith(CB_SUG_APPROVE_PREFIX)
+        or call.data.startswith(CB_SUG_REJECT_PREFIX)
+    )
+)
 def handle_ttk_callback(call: types.CallbackQuery):
     data = call.data or ""
     uid = call.from_user.id if call.from_user else 0
     username = (call.from_user.username or "") if call.from_user else ""
+
+    if data.startswith(CB_SUG_APPROVE_PREFIX) or data.startswith(CB_SUG_REJECT_PREFIX):
+        is_approve = data.startswith(CB_SUG_APPROVE_PREFIX)
+        sug_id = data[len(CB_SUG_APPROVE_PREFIX) :] if is_approve else data[len(CB_SUG_REJECT_PREFIX) :]
+        if not is_admin(uid):
+            try:
+                bot.answer_callback_query(call.id, "Только администратор может принимать решения по предложениям.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        sug = SUGGESTIONS_STORE.get(sug_id)
+        if not sug:
+            try:
+                bot.answer_callback_query(call.id, "Предложение не найдено или устарело.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if sug.get("status") != "pending":
+            try:
+                bot.answer_callback_query(call.id, "Решение по этому предложению уже принято.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        sug["status"] = "approved" if is_approve else "rejected"
+        author_id = int(sug.get("author_id") or 0)
+        title = str(sug.get("title") or "Коктейль")
+        cat = str(sug.get("category") or "авторские")
+
+        try:
+            bot.answer_callback_query(call.id, "Добавлено в ТТК" if is_approve else "Отклонено")
+        except Exception:
+            pass
+
+        if is_approve:
+            ok, res = create_ttk_from_text(str(sug.get("raw_text") or ""), cat, uid, username)
+            if ok and isinstance(res, list) and call.message:
+                for card in res:
+                    safe_send_media_card(call.message.chat.id, card)
+            if call.message:
+                try:
+                    bot.edit_message_text(
+                        f"{call.message.text or ''}\n\n✅ <b>Добавлено в базу ({esc(cat or 'без категории')})</b>",
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                    )
+                except Exception:
+                    pass
+            if author_id:
+                safe_send_text(author_id, f"🎉 Твоё предложение «<b>{esc(title)}</b>» одобрено и добавлено в меню!")
+        else:
+            if call.message:
+                try:
+                    bot.edit_message_text(
+                        f"{call.message.text or ''}\n\n❌ <b>Отклонено администратором</b>",
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                    )
+                except Exception:
+                    pass
+            if author_id:
+                safe_send_text(author_id, f"ℹ️ Предложение «<b>{esc(title)}</b>» не добавлено.")
+        return
 
     if data.startswith(CB_CARD_PREFIX):
         short_key = data[len(CB_CARD_PREFIX) :]
@@ -1968,18 +2193,24 @@ def cmd_start(msg: types.Message):
 @bot.message_handler(commands=["bulk"])
 def cmd_bulk(msg: types.Message):
     touch_user(msg)
+    if not require_admin_msg(msg):
+        return
     ask_bulk_category(msg)
 
 
 @bot.message_handler(commands=["clean_titles"])
 def cmd_clean_titles(msg: types.Message):
     touch_user(msg)
+    if not require_admin_msg(msg):
+        return
     run_clean_titles_report(msg)
 
 
 @bot.message_handler(content_types=["document", "photo"])
 def handle_media_upload(msg: types.Message):
     touch_user(msg)
+    if not require_admin_msg(msg):
+        return
     uid = msg.from_user.id
     username = msg.from_user.username or ""
     st = USER_STATES.get(uid) or {}
@@ -2049,7 +2280,52 @@ def handle_text(msg: types.Message):
     low = norm_text(text)
     st = USER_STATES.get(uid) or {}
 
+    if st.get("mode") == "suggest_choose_cat":
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
+            return
+        chosen_cat = "" if low == "без категории" else low
+        if chosen_cat and chosen_cat not in TTK_CATEGORIES:
+            safe_send_text(msg.chat.id, "Выбери вкладку на клавиатуре ниже:", reply_markup=ttk_category_keyboard())
+            return
+        USER_STATES[uid] = {"mode": "suggest_wait_text", "category": chosen_cat}
+        safe_send_text(
+            msg.chat.id,
+            f"Вкладка: <b>{esc(chosen_cat or 'без категории')}</b>.\n\n"
+            "Напиши предложение по схеме:\n"
+            "1. Название коктейля\n"
+            "<i>(пустая строка)</i>\n"
+            "2. Состав (например: <code>Водка 600мл, сок лимона 150мл, яблочный сок 1200мл</code>)\n"
+            "<i>(пустая строка)</i>\n"
+            "3. Метод приготовления\n\n"
+            "После отправки администратор получит уведомление и решит, добавлять ли коктейль.",
+            reply_markup=back_only_keyboard(),
+        )
+        return
+
+    if st.get("mode") == "suggest_wait_text":
+        if text == BTN_BACK:
+            USER_STATES[uid] = {"mode": "suggest_choose_cat"}
+            safe_send_text(msg.chat.id, "Выбери вкладку для предлагаемого коктейля:", reply_markup=ttk_category_keyboard())
+            return
+        cat = str(st.get("category") or "авторские")
+        USER_STATES.pop(uid, None)
+        ok, res = submit_cocktail_suggestion(msg, text, category=cat)
+        if not ok:
+            safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=main_menu_keyboard(uid))
+            return
+        safe_send_text(
+            msg.chat.id,
+            f"✅ Предложение «<b>{esc(res)}</b>» отправлено администратору на рассмотрение!",
+            reply_markup=main_menu_keyboard(uid),
+        )
+        return
+
     if st.get("mode") == "bulk_choose_cat":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
             safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
@@ -2062,6 +2338,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "media_bulk_add":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         if text == BTN_DONE:
             finish_bulk_mode(msg)
             return
@@ -2079,6 +2358,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "add_ttk_choose_cat":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
             safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
@@ -2094,15 +2376,19 @@ def handle_text(msg: types.Message):
             "Пиши удобно по абзацам (через одну пустую строку):\n"
             "1. Название коктейля или премикса\n"
             "<i>(пустая строка)</i>\n"
-            "2. Состав (например: <code>Сок яблочный 1200мл, сок лимона 150мл, водка 600мл</code>)\n"
+            "2. Состав (например: <code>Водка 600мл, сок лимона 150мл, яблочный сок 1200мл</code>)\n"
             "<i>(пустая строка)</i>\n"
             "3. Метод приготовления\n\n"
+            "Итоговый выход напитка посчитается автоматически и добавится в конец состава перед приготовлением.\n"
             "Чтобы добавить сразу несколько позиций в одном сообщении, отделяй их строкой <code>---</code>.",
             reply_markup=back_only_keyboard(),
         )
         return
 
     if st.get("mode") == "add_ttk_wait_text":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         if text == BTN_BACK:
             USER_STATES[uid] = {"mode": "add_ttk_choose_cat"}
             safe_send_text(msg.chat.id, "Выбери категорию для новой ТТК:", reply_markup=ttk_category_keyboard())
@@ -2133,6 +2419,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "ttk_choose_tab":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
             safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
@@ -2150,6 +2439,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "ttk_select":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         page = int(st.get("page") or 0)
         manage_key = str(st.get("manage_key") or "__all__")
         tab_label = _manage_tab_label(manage_key)
@@ -2227,6 +2519,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "ttk_wait_tab_delete_nums":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         page = int(st.get("page") or 0)
         manage_key = str(st.get("manage_key") or "__all__")
         tab_label = _manage_tab_label(manage_key)
@@ -2253,6 +2548,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "ttk_card_actions":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         card_id = st.get("card_id")
         manage_key = str(st.get("manage_key") or "__all__")
         page = int(st.get("page") or 0)
@@ -2312,6 +2610,9 @@ def handle_text(msg: types.Message):
             return
 
     if st.get("mode") == "ttk_wait_rename":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         card_id = st.get("card_id")
         manage_key = str(st.get("manage_key") or "__all__")
         page = int(st.get("page") or 0)
@@ -2335,6 +2636,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "ttk_wait_cat":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         card_id = st.get("card_id")
         manage_key = str(st.get("manage_key") or "__all__")
         page = int(st.get("page") or 0)
@@ -2386,6 +2690,9 @@ def handle_text(msg: types.Message):
         return
 
     if st.get("mode") == "dishware_item":
+        if not require_admin_msg(msg):
+            USER_STATES.pop(uid, None)
+            return
         item_id = st.get("item_id")
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
@@ -2419,7 +2726,18 @@ def handle_text(msg: types.Message):
         safe_send_text(msg.chat.id, "Главное меню:", reply_markup=main_menu_keyboard(uid))
         return
 
+    if text == BTN_SUGGEST_COCKTAIL or low in ("предложить коктейль", "предложить"):
+        USER_STATES[uid] = {"mode": "suggest_choose_cat"}
+        safe_send_text(
+            msg.chat.id,
+            "💡 Выбери вкладку, куда предлагаешь добавить коктейль:",
+            reply_markup=ttk_category_keyboard(),
+        )
+        return
+
     if text == BTN_ADD_TTK_TEXT:
+        if not require_admin_msg(msg):
+            return
         USER_STATES[uid] = {"mode": "add_ttk_choose_cat"}
         safe_send_text(msg.chat.id, "Выбери категорию для новой ТТК:", reply_markup=ttk_category_keyboard())
         return
@@ -2452,18 +2770,24 @@ def handle_text(msg: types.Message):
         return
 
     if text == BTN_DISHWARE or low == "посуда":
+        if not require_admin_msg(msg):
+            return
         USER_STATES.pop(uid, None)
         log_activity(uid, username, "OPEN_DISHWARE")
         safe_send_text(msg.chat.id, "🥃 Выбери позицию посуды:", reply_markup=dishware_menu_keyboard(uid))
         return
 
     if text == BTN_DISH_SUMMARY:
+        if not require_admin_msg(msg):
+            return
         log_activity(uid, username, "DISHWARE_SUMMARY")
         safe_send_text(msg.chat.id, format_dishware_summary(), reply_markup=dishware_menu_keyboard(uid))
         return
 
     matched_dish = match_dishware_button(text)
     if matched_dish:
+        if not require_admin_msg(msg):
+            return
         USER_STATES[uid] = {
             "mode": "dishware_item",
             "item_id": matched_dish.get("id"),
@@ -2487,6 +2811,8 @@ def handle_text(msg: types.Message):
         return
 
     if text == BTN_USERS or low == "пользователи":
+        if not require_admin_msg(msg):
+            return
         log_activity(uid, username, "OPEN_USERS")
         show_users_and_actions(msg)
         return
@@ -2537,7 +2863,7 @@ def start_web_server() -> None:
 # =========================================================
 def main() -> None:
     print(
-        f"[NEW BUILD v10.31] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"[NEW BUILD v10.32] Запуск бота (supabase: {SUPABASE_ENABLED}, "
         f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
         flush=True,
     )
