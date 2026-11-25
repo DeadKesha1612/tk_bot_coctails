@@ -31,6 +31,7 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_ID_RAW = (os.getenv("ADMIN_ID") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
+SUPABASE_STORAGE_BUCKET = (os.getenv("SUPABASE_STORAGE_BUCKET") or "tk-media").strip()
 DONATIONALERTS_URL = (
     os.getenv("DONATIONALERTS_URL") or "https://www.donationalerts.com/r/your_link"
 ).strip()
@@ -41,6 +42,7 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+SUPABASE_STORAGE_ENABLED = bool(SUPABASE_ENABLED and SUPABASE_STORAGE_BUCKET)
 
 DATA_DIR = os.getenv("DATA_DIR", "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "user_media")
@@ -80,6 +82,8 @@ BTN_TTK_RENAME = "📝 Переименовать"
 BTN_TTK_CAT = "🗂 Категория"
 BTN_TTK_REPLACE_FILE = "🔄 Заменить файл"
 BTN_TTK_DELETE = "🗑 Удалить ТТК"
+BTN_TTK_DELETE_IN_TAB = "🗑 Удалить в этой вкладке"
+BTN_TTK_CHANGE_TAB = "📂 Сменить вкладку"
 BTN_TTK_NEXT = "➡️ Дальше"
 BTN_TTK_PREV = "⬅️ Пред."
 
@@ -265,6 +269,15 @@ def recipes_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     return kb
 
 
+def manage_tab_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("Авторские"), types.KeyboardButton("Классические"))
+    kb.row(types.KeyboardButton("Наливки"), types.KeyboardButton("Коктейли меню"))
+    kb.row(types.KeyboardButton("Без категории"), types.KeyboardButton("Все карточки"))
+    kb.row(types.KeyboardButton(BTN_BACK))
+    return kb
+
+
 def _register_card_callback_key(card_id: str) -> str:
     short_key = re.sub(r"[^0-9A-Za-z_-]", "", str(card_id))[-24:] or uuid.uuid4().hex[:10]
     CALLBACK_CARD_MAP[short_key] = str(card_id)
@@ -330,6 +343,7 @@ def ttk_list_keyboard(page: int, total_pages: int) -> types.ReplyKeyboardMarkup:
         nav.append(types.KeyboardButton(BTN_TTK_NEXT))
     if nav:
         kb.row(*nav)
+    kb.row(types.KeyboardButton(BTN_TTK_DELETE_IN_TAB), types.KeyboardButton(BTN_TTK_CHANGE_TAB))
     kb.row(types.KeyboardButton(BTN_BACK))
     return kb
 
@@ -363,7 +377,7 @@ def bulk_done_keyboard() -> types.ReplyKeyboardMarkup:
 
 
 # =========================================================
-# SUPABASE REST API + ЛОКАЛЬНЫЙ СНИМОК
+# SUPABASE REST API + STORAGE + ЛОКАЛЬНЫЙ СНИМОК
 # =========================================================
 def sb_request(method: str, table: str, query: str = "", payload=None, prefer: str = ""):
     if not SUPABASE_ENABLED:
@@ -417,6 +431,86 @@ def sb_upsert(table: str, row: dict, on_conflict: str = "id"):
 
 def sb_delete(table: str, query: str):
     return sb_request("DELETE", table, query=query)
+
+
+def _storage_object_path(card_id: str, ext: str = ".png") -> str:
+    clean_ext = ext if ext.startswith(".") else f".{ext}"
+    clean_ext = re.sub(r"[^0-9A-Za-z.]", "", clean_ext)[:8] or ".png"
+    return f"cards/{card_id}{clean_ext}"
+
+
+def _content_type_for_ext(ext: str) -> str:
+    low_ext = (ext or "").lower()
+    if low_ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if low_ext == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def storage_upload_bytes(object_path: str, raw_bytes: bytes, content_type: str = "image/png") -> str | None:
+    if not SUPABASE_STORAGE_ENABLED or not raw_bytes:
+        return None
+    encoded_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
+    url = f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_STORAGE_BUCKET)}/{encoded_path}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    req = urllib.request.Request(url, data=raw_bytes, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                return object_path
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"[WARN] Supabase Storage upload failed ({object_path}) HTTP {e.code}: {body}", flush=True)
+    except Exception as e:
+        print(f"[WARN] Supabase Storage upload error ({object_path}): {e}", flush=True)
+    return None
+
+
+def storage_download_bytes(object_path: str) -> bytes | None:
+    if not SUPABASE_STORAGE_ENABLED or not object_path:
+        return None
+    encoded_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
+    candidates = [
+        f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_STORAGE_BUCKET)}/{encoded_path}",
+        f"{SUPABASE_URL}/storage/v1/object/public/{urllib.parse.quote(SUPABASE_STORAGE_BUCKET)}/{encoded_path}",
+    ]
+    for url in candidates:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read()
+                if data:
+                    return data
+        except Exception:
+            continue
+    return None
+
+
+def storage_delete_object(object_path: str) -> None:
+    if not SUPABASE_STORAGE_ENABLED or not object_path:
+        return
+    encoded_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
+    url = f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_STORAGE_BUCKET)}/{encoded_path}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    req = urllib.request.Request(url, headers=headers, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except Exception as e:
+        print(f"[WARN] Supabase Storage delete failed ({object_path}): {e}", flush=True)
 
 
 def sync_local_from_memory() -> None:
@@ -508,6 +602,7 @@ def load_data() -> None:
                     "category": str(m.get("category") or local_cat_by_id.get(str(m.get("id"))) or ""),
                     "photo_file_id": m.get("photo_file_id"),
                     "photo_path": m.get("photo_path"),
+                    "storage_path": m.get("storage_path"),
                     "created_at": str(m.get("created_at") or now_str()),
                 }
                 for m in media_rows
@@ -870,6 +965,31 @@ def render_ttk_png_bytes(title: str, body_text: str, category: str = "") -> byte
     return buf.getvalue()
 
 
+def _store_card_bytes(
+    card_id: str,
+    raw_bytes: bytes,
+    ext: str = ".png",
+    upload_to_storage: bool = True,
+) -> tuple[str | None, str | None]:
+    clean_ext = ext if ext.startswith(".") else f".{ext}"
+    clean_ext = re.sub(r"[^0-9A-Za-z.]", "", clean_ext)[:8] or ".png"
+    local_path = os.path.join(MEDIA_DIR, f"{card_id}{clean_ext}")
+    saved_local = None
+    try:
+        with open(local_path, "wb") as out:
+            out.write(raw_bytes)
+        saved_local = local_path
+    except Exception as e:
+        print(f"[WARN] write local media file failed ({local_path}): {e}", flush=True)
+
+    storage_path = None
+    if upload_to_storage and SUPABASE_STORAGE_ENABLED:
+        obj_path = _storage_object_path(card_id, clean_ext)
+        storage_path = storage_upload_bytes(obj_path, raw_bytes, _content_type_for_ext(clean_ext))
+
+    return saved_local, storage_path
+
+
 def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) -> tuple[bool, dict | str]:
     lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
     if not lines:
@@ -892,17 +1012,12 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
         return False, "Не удалось определить название ТТК."
 
     card_id = f"media_{uuid.uuid4().hex[:10]}"
-    local_path = os.path.join(MEDIA_DIR, f"{card_id}.png")
     png_bytes = render_ttk_png_bytes(title, body, category=category)
-    if png_bytes:
-        try:
-            with open(local_path, "wb") as out:
-                out.write(png_bytes)
-        except Exception as e:
-            print(f"[WARN] write rendered PNG failed: {e}", flush=True)
-            local_path = None
-    else:
-        local_path = None
+    local_path, storage_path = (
+        _store_card_bytes(card_id, png_bytes, ext=".png", upload_to_storage=True)
+        if png_bytes
+        else (None, None)
+    )
 
     card = {
         "id": card_id,
@@ -910,14 +1025,24 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
         "category": category,
         "photo_file_id": None,
         "photo_path": local_path,
+        "storage_path": storage_path,
         "created_at": now_str(),
     }
 
     with DATA_LOCK:
         cards = DB.setdefault("media_cards", [])
-        existing = next((c for c in cards if norm_text(c.get("title")) == norm_text(title)), None)
+        existing = next(
+            (
+                c
+                for c in cards
+                if norm_text(c.get("title")) == norm_text(title)
+                and norm_text(c.get("category")) == norm_text(category)
+            ),
+            None,
+        )
         if existing:
             existing["photo_path"] = local_path
+            existing["storage_path"] = storage_path
             existing["photo_file_id"] = None
             existing["created_at"] = card["created_at"]
             if category:
@@ -933,22 +1058,26 @@ def create_ttk_from_text(raw_text: str, category: str, uid: int, username: str) 
 
 def persist_media_card(card: dict) -> None:
     sync_local_from_memory()
-    row = {
+    full_row = {
         "id": str(card["id"]),
         "title": str(card.get("title") or ""),
         "category": str(card.get("category") or ""),
         "photo_file_id": card.get("photo_file_id"),
         "photo_path": card.get("photo_path"),
+        "storage_path": card.get("storage_path"),
         "created_at": str(card.get("created_at") or now_str()),
     }
-    res = sb_upsert("tk_media_cards", row, "id")
-    if res is None and "category" in row:
-        row_no_cat = {k: v for k, v in row.items() if k != "category"}
-        sb_upsert("tk_media_cards", row_no_cat, "id")
+    res = sb_upsert("tk_media_cards", full_row, "id")
+    if res is None:
+        fallback_row = {
+            k: v
+            for k, v in full_row.items()
+            if k not in ("category", "storage_path")
+        }
+        sb_upsert("tk_media_cards", fallback_row, "id")
 
 
 def clean_existing_media_titles(uid: int, username: str) -> list[tuple[str, str]]:
-    """Очищает названия всех существующих карточек в базе по правилам clean_uploaded_title."""
     changed: list[tuple[str, str]] = []
     with DATA_LOCK:
         cards = DB.get("media_cards", [])
@@ -981,8 +1110,16 @@ def delete_media_card_by_id(card_id: str, uid: int, username: str) -> dict | Non
         except Exception as e:
             print(f"[WARN] remove local media file failed: {e}", flush=True)
 
+    storage_path = removed.get("storage_path") or _storage_object_path(str(card_id), ".png")
+    storage_delete_object(storage_path)
+
     sb_delete("tk_media_cards", f"id=eq.{urllib.parse.quote(str(card_id))}")
-    log_activity(uid, username, "TTK_DELETE", str(removed.get("title") or card_id))
+    log_activity(
+        uid,
+        username,
+        "TTK_DELETE",
+        f"{removed.get('title') or card_id} [{removed.get('category') or 'без категории'}]",
+    )
     return removed
 
 
@@ -1037,15 +1174,18 @@ def replace_media_card_file(card_id: str, msg: types.Message, uid: int, username
     else:
         return False, "Отправьте новый файл (например, .png) или картинку."
 
-    local_path = os.path.join(MEDIA_DIR, f"{card_id}{ext}")
+    downloaded = None
     try:
         file_info = bot.get_file(file_id)
         downloaded = bot.download_file(file_info.file_path)
-        with open(local_path, "wb") as out:
-            out.write(downloaded)
     except Exception as e:
         print(f"[WARN] replace download_file failed: {e}", flush=True)
-        local_path = None
+
+    local_path, storage_path = (
+        _store_card_bytes(str(card_id), downloaded, ext=ext, upload_to_storage=True)
+        if downloaded
+        else (None, None)
+    )
 
     with DATA_LOCK:
         cards = DB.get("media_cards", [])
@@ -1054,6 +1194,8 @@ def replace_media_card_file(card_id: str, msg: types.Message, uid: int, username
             return False, "Карточка не найдена."
         card["photo_file_id"] = file_id
         card["photo_path"] = local_path
+        if storage_path:
+            card["storage_path"] = storage_path
         persist_media_card(card)
 
     log_activity(uid, username, "TTK_REPLACE_FILE", str(card.get("title") or card_id))
@@ -1080,17 +1222,18 @@ def save_incoming_media_card(msg: types.Message, active_category: str = "") -> t
         return False, "Поддерживаются только файлы/документы (например, .png) и изображения."
 
     card_id = f"media_{uuid.uuid4().hex[:10]}"
-    safe_disk_name = f"{card_id}{ext}"
-    local_path = os.path.join(MEDIA_DIR, safe_disk_name)
-
+    downloaded = None
     try:
         file_info = bot.get_file(file_id)
         downloaded = bot.download_file(file_info.file_path)
-        with open(local_path, "wb") as out:
-            out.write(downloaded)
     except Exception as e:
         print(f"[WARN] download_file failed ({exact_title}): {e}", flush=True)
-        local_path = None
+
+    local_path, storage_path = (
+        _store_card_bytes(card_id, downloaded, ext=ext, upload_to_storage=True)
+        if downloaded
+        else (None, None)
+    )
 
     card = {
         "id": card_id,
@@ -1098,16 +1241,27 @@ def save_incoming_media_card(msg: types.Message, active_category: str = "") -> t
         "category": active_category,
         "photo_file_id": file_id,
         "photo_path": local_path,
+        "storage_path": storage_path,
         "created_at": now_str(),
     }
 
     with DATA_LOCK:
         cards = DB.setdefault("media_cards", [])
-        existing = next((c for c in cards if norm_text(c.get("title")) == norm_text(exact_title)), None)
+        existing = next(
+            (
+                c
+                for c in cards
+                if norm_text(c.get("title")) == norm_text(exact_title)
+                and norm_text(c.get("category")) == norm_text(active_category)
+            ),
+            None,
+        )
         if existing:
             existing["title"] = exact_title
             existing["photo_file_id"] = card["photo_file_id"]
             existing["photo_path"] = card["photo_path"]
+            if storage_path:
+                existing["storage_path"] = storage_path
             existing["created_at"] = card["created_at"]
             if active_category:
                 existing["category"] = active_category
@@ -1140,6 +1294,8 @@ def _bytes_to_jpeg_stream(raw_bytes: bytes) -> io.BytesIO:
 def _build_photo_stream(card: dict):
     photo_path = card.get("photo_path")
     file_id = card.get("photo_file_id")
+    storage_path = card.get("storage_path")
+    card_id = str(card.get("id") or "")
 
     if photo_path and os.path.isfile(photo_path):
         try:
@@ -1148,18 +1304,41 @@ def _build_photo_stream(card: dict):
         except Exception as e:
             print(f"[WARN] read photo_path failed ({photo_path}): {e}", flush=True)
 
+    candidate_storage_paths = []
+    if storage_path:
+        candidate_storage_paths.append(str(storage_path))
+    if card_id:
+        ext = os.path.splitext(photo_path or "")[1] or ".png"
+        candidate_storage_paths.append(_storage_object_path(card_id, ext))
+        if ext != ".png":
+            candidate_storage_paths.append(_storage_object_path(card_id, ".png"))
+
+    for sp in candidate_storage_paths:
+        cloud_bytes = storage_download_bytes(sp)
+        if cloud_bytes:
+            if photo_path:
+                try:
+                    os.makedirs(os.path.dirname(photo_path), exist_ok=True)
+                    with open(photo_path, "wb") as out:
+                        out.write(cloud_bytes)
+                except Exception:
+                    pass
+            return _bytes_to_jpeg_stream(cloud_bytes)
+
     if file_id:
         try:
             file_info = bot.get_file(file_id)
             downloaded = bot.download_file(file_info.file_path)
             if downloaded:
-                if photo_path:
-                    try:
-                        os.makedirs(os.path.dirname(photo_path), exist_ok=True)
-                        with open(photo_path, "wb") as out:
-                            out.write(downloaded)
-                    except Exception:
-                        pass
+                ext = os.path.splitext(photo_path or file_info.file_path or "")[1] or ".png"
+                saved_local, uploaded_sp = _store_card_bytes(card_id, downloaded, ext=ext, upload_to_storage=True)
+                with DATA_LOCK:
+                    if saved_local:
+                        card["photo_path"] = saved_local
+                    if uploaded_sp:
+                        card["storage_path"] = uploaded_sp
+                    if saved_local or uploaded_sp:
+                        persist_media_card(card)
                 return _bytes_to_jpeg_stream(downloaded)
         except Exception as e:
             print(f"[WARN] download by photo_file_id failed ({file_id}): {e}", flush=True)
@@ -1187,7 +1366,7 @@ def safe_send_media_card(chat_id: int, card: dict, reply_markup=None) -> None:
 
     safe_send_text(
         chat_id,
-        f"{caption}\n<i>⚠️ Фото недоступно на сервере (файл не найден). Загрузи карточку заново.</i>",
+        f"{caption}\n<i>⚠️ Фото недоступно в хранилище (файл не найден). Загрузи карточку заново.</i>",
         reply_markup=reply_markup,
     )
 
@@ -1241,9 +1420,25 @@ def find_media_matches(query: str) -> list[dict]:
 def _get_filtered_cards(category_key: str) -> list[dict]:
     with DATA_LOCK:
         all_cards = list(DB.get("media_cards", []))
+    if category_key == "__uncategorized__":
+        return [c for c in all_cards if not norm_text(c.get("category"))]
     if category_key:
         return [c for c in all_cards if norm_text(c.get("category")) == category_key]
     return all_cards
+
+
+def _manage_tab_label(manage_key: str) -> str:
+    if manage_key == "__all__":
+        return "Все карточки"
+    if manage_key == "__uncategorized__":
+        return "Без категории"
+    return manage_key.capitalize() if manage_key else "Все карточки"
+
+
+def _get_manage_tab_cards(manage_key: str) -> list[dict]:
+    if manage_key == "__all__":
+        return _get_filtered_cards("")
+    return _get_filtered_cards(manage_key)
 
 
 def _build_popup_page_payload(cards: list[dict], header_title: str, page: int, category_key: str):
@@ -1279,16 +1474,36 @@ def show_ttk_popup_page(
     safe_send_text(msg.chat.id, text, reply_markup=kb)
 
 
-def show_ttk_manage_page(msg: types.Message, page: int = 0) -> None:
+def ask_manage_tab(msg: types.Message) -> None:
     uid = msg.from_user.id
     if not is_admin(uid):
         safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
         return
-    with DATA_LOCK:
-        cards = list(DB.get("media_cards", []))
+    USER_STATES[uid] = {"mode": "ttk_choose_tab"}
+    safe_send_text(
+        msg.chat.id,
+        "✏️ <b>Управление ТТК</b>\n\n"
+        "Выбери вкладку — покажу карточки и удаление только внутри неё, чтобы случайно не задеть другие вкладки:",
+        reply_markup=manage_tab_keyboard(),
+    )
+
+
+def show_ttk_manage_page(msg: types.Message, page: int = 0, manage_key: str = "__all__") -> None:
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        safe_send_text(msg.chat.id, "Недостаточно прав.", reply_markup=main_menu_keyboard(uid))
+        return
+
+    cards = _get_manage_tab_cards(manage_key)
+    tab_label = _manage_tab_label(manage_key)
+
     if not cards:
-        USER_STATES.pop(uid, None)
-        safe_send_text(msg.chat.id, "ТТК (карточек) пока нет.", reply_markup=recipes_menu_keyboard(uid))
+        USER_STATES[uid] = {"mode": "ttk_choose_tab"}
+        safe_send_text(
+            msg.chat.id,
+            f"Во вкладке «<b>{esc(tab_label)}</b>» карточек нет. Выбери другую вкладку:",
+            reply_markup=manage_tab_keyboard(),
+        )
         return
 
     per_page = 10
@@ -1300,32 +1515,38 @@ def show_ttk_manage_page(msg: types.Message, page: int = 0) -> None:
     USER_STATES[uid] = {
         "mode": "ttk_select",
         "page": page,
-        "page_map": {str(start_idx + i + 1): c.get("id") for i, c in enumerate(chunk)},
+        "manage_key": manage_key,
     }
 
     lines = []
     for i, c in enumerate(chunk, start=start_idx + 1):
-        cat = f" <i>[{esc(c.get('category'))}]</i>" if c.get("category") else ""
-        lines.append(f"<b>{i}.</b> {esc(c.get('title') or '')}{cat}")
+        cat_tag = f" <i>[{esc(c.get('category') or 'без категории')}]</i>" if manage_key == "__all__" else ""
+        lines.append(f"<b>{i}.</b> {esc(c.get('title') or '')}{cat_tag}")
 
     safe_send_text(
         msg.chat.id,
-        f"✏️ <b>Управление ТТК</b> (стр. {page + 1}/{total_pages}, всего {len(cards)}):\n\n"
+        f"✏️ <b>Вкладка: {esc(tab_label)}</b> (стр. {page + 1}/{total_pages}, всего {len(cards)}):\n\n"
         + "\n".join(lines)
-        + "\n\n• Напиши <b>один номер</b> (например, <code>1</code>) или точное название для редактирования/удаления.\n"
-        "• Напиши <b>несколько номеров через запятую</b> (например, <code>1, 3, 5</code> или <code>1-3</code>), чтобы удалить их сразу.",
+        + "\n\n• Напиши <b>номер</b> (например, <code>1</code>) или точное название для редактирования/удаления.\n"
+        "• Нажми <b>🗑 Удалить в этой вкладке</b> или напиши номера через запятую (<code>1, 3, 5</code> / <code>1-3</code>), "
+        "чтобы удалить карточки только из вкладки «<b>" + esc(tab_label) + "</b>».",
         reply_markup=ttk_list_keyboard(page, total_pages),
     )
 
 
-def open_ttk_card_actions(msg: types.Message, card: dict) -> None:
+def open_ttk_card_actions(msg: types.Message, card: dict, manage_key: str = "__all__", page: int = 0) -> None:
     uid = msg.from_user.id
-    USER_STATES[uid] = {"mode": "ttk_card_actions", "card_id": card.get("id")}
-    cat_label = card.get("category") or "не задана"
+    USER_STATES[uid] = {
+        "mode": "ttk_card_actions",
+        "card_id": card.get("id"),
+        "manage_key": manage_key,
+        "page": page,
+    }
+    cat_label = card.get("category") or "без категории"
     safe_send_text(
         msg.chat.id,
         f"📄 <b>{esc(card.get('title') or '')}</b>\n"
-        f"Категория: <b>{esc(cat_label)}</b>\n\n"
+        f"Вкладка: <b>{esc(cat_label)}</b>\n\n"
         "Выбери действие:",
         reply_markup=ttk_edit_keyboard(),
     )
@@ -1695,7 +1916,7 @@ def handle_text(msg: types.Message):
             safe_send_text(msg.chat.id, f"⚠️ {esc(res)}", reply_markup=recipes_menu_keyboard(uid))
             return
         card = res
-        if not card.get("photo_path"):
+        if not card.get("photo_path") and not card.get("storage_path"):
             safe_send_text(
                 msg.chat.id,
                 f"⚠️ Карточка <b>{esc(card.get('title'))}</b> сохранена, но модуль Pillow не установлен — PNG не сгенерирован.",
@@ -1705,28 +1926,65 @@ def handle_text(msg: types.Message):
         safe_send_media_card(msg.chat.id, card, reply_markup=recipes_menu_keyboard(uid))
         return
 
-    if st.get("mode") == "ttk_select":
-        page = int(st.get("page") or 0)
+    if st.get("mode") == "ttk_choose_tab":
         if text == BTN_BACK:
             USER_STATES.pop(uid, None)
             safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
             return
+        if low == "все карточки":
+            show_ttk_manage_page(msg, 0, manage_key="__all__")
+            return
+        if low == "без категории":
+            show_ttk_manage_page(msg, 0, manage_key="__uncategorized__")
+            return
+        if low in TTK_CATEGORIES:
+            show_ttk_manage_page(msg, 0, manage_key=low)
+            return
+        safe_send_text(msg.chat.id, "Выбери вкладку на клавиатуре ниже:", reply_markup=manage_tab_keyboard())
+        return
+
+    if st.get("mode") == "ttk_select":
+        page = int(st.get("page") or 0)
+        manage_key = str(st.get("manage_key") or "__all__")
+        tab_label = _manage_tab_label(manage_key)
+
+        if text == BTN_BACK:
+            USER_STATES.pop(uid, None)
+            safe_send_text(msg.chat.id, "🍸 Выбери раздел рецептов:", reply_markup=recipes_menu_keyboard(uid))
+            return
+        if text == BTN_TTK_CHANGE_TAB:
+            ask_manage_tab(msg)
+            return
         if text == BTN_TTK_NEXT:
-            show_ttk_manage_page(msg, page + 1)
+            show_ttk_manage_page(msg, page + 1, manage_key=manage_key)
             return
         if text == BTN_TTK_PREV:
-            show_ttk_manage_page(msg, page - 1)
+            show_ttk_manage_page(msg, page - 1, manage_key=manage_key)
             return
 
-        with DATA_LOCK:
-            cards = list(DB.get("media_cards", []))
+        cards = _get_manage_tab_cards(manage_key)
+
+        if text == BTN_TTK_DELETE_IN_TAB:
+            USER_STATES[uid] = {
+                "mode": "ttk_wait_tab_delete_nums",
+                "page": page,
+                "manage_key": manage_key,
+            }
+            safe_send_text(
+                msg.chat.id,
+                f"🗑 Удаление карточек <b>только из вкладки «{esc(tab_label)}»</b> (всего {len(cards)}).\n"
+                "Напиши номер или номера через запятую / диапазон (например: <code>1</code>, <code>1, 3, 5</code> или <code>1-3</code>):",
+                reply_markup=back_only_keyboard(),
+            )
+            return
 
         if "," in text or "-" in text:
             selected_nums = parse_number_selection(text, len(cards))
             if not selected_nums:
                 safe_send_text(
                     msg.chat.id,
-                    f"⚠️ Некорректные номера. Укажи числа от 1 до {len(cards)} через запятую (например, <code>1, 2, 4</code>).",
+                    f"⚠️ Некорректные номера во вкладке «{esc(tab_label)}». "
+                    f"Укажи числа от 1 до {len(cards)} через запятую (например, <code>1, 2, 4</code>).",
                     reply_markup=ttk_list_keyboard(page, max(1, (len(cards) + 9) // 10)),
                 )
                 return
@@ -1735,40 +1993,76 @@ def handle_text(msg: types.Message):
             removed_names = "\n".join(f"• {esc(r.get('title') or '')}" for r in removed_items)
             safe_send_text(
                 msg.chat.id,
-                f"🗑 Удалено ТТК: <b>{len(removed_items)}</b>\n\n{removed_names}",
+                f"🗑 Удалено из вкладки «<b>{esc(tab_label)}</b>»: <b>{len(removed_items)}</b>\n\n{removed_names}",
             )
-            show_ttk_manage_page(msg, page)
+            show_ttk_manage_page(msg, page, manage_key=manage_key)
             return
 
         if text.isdigit():
             idx = int(text) - 1
             if 0 <= idx < len(cards):
-                open_ttk_card_actions(msg, cards[idx])
+                open_ttk_card_actions(msg, cards[idx], manage_key=manage_key, page=page)
                 return
-            safe_send_text(msg.chat.id, f"⚠️ ТТК с номером {text} нет (всего {len(cards)}).")
+            safe_send_text(
+                msg.chat.id,
+                f"⚠️ Во вкладке «{esc(tab_label)}» нет ТТК с номером {text} (всего {len(cards)}).",
+            )
             return
 
         target = next((c for c in cards if norm_text(c.get("title")) == low), None)
         if target:
-            open_ttk_card_actions(msg, target)
+            open_ttk_card_actions(msg, target, manage_key=manage_key, page=page)
             return
 
         safe_send_text(
             msg.chat.id,
-            "Введи номер ТТК, несколько номеров через запятую (например, <code>1, 2, 3</code>) или точное название.",
+            f"Введи номер ТТК из вкладки «{esc(tab_label)}», несколько номеров через запятую (<code>1, 2, 3</code>) или точное название.",
         )
+        return
+
+    if st.get("mode") == "ttk_wait_tab_delete_nums":
+        page = int(st.get("page") or 0)
+        manage_key = str(st.get("manage_key") or "__all__")
+        tab_label = _manage_tab_label(manage_key)
+        if text == BTN_BACK:
+            show_ttk_manage_page(msg, page, manage_key=manage_key)
+            return
+        cards = _get_manage_tab_cards(manage_key)
+        selected_nums = parse_number_selection(text, len(cards))
+        if not selected_nums:
+            safe_send_text(
+                msg.chat.id,
+                f"⚠️ Некорректные номера. Укажи номера от 1 до {len(cards)} для вкладки «{esc(tab_label)}».",
+                reply_markup=back_only_keyboard(),
+            )
+            return
+        target_ids = [str(cards[n - 1].get("id")) for n in selected_nums]
+        removed_items = delete_media_cards_bulk(target_ids, uid, username)
+        removed_names = "\n".join(f"• {esc(r.get('title') or '')}" for r in removed_items)
+        safe_send_text(
+            msg.chat.id,
+            f"🗑 Удалено из вкладки «<b>{esc(tab_label)}</b>»: <b>{len(removed_items)}</b>\n\n{removed_names}",
+        )
+        show_ttk_manage_page(msg, page, manage_key=manage_key)
         return
 
     if st.get("mode") == "ttk_card_actions":
         card_id = st.get("card_id")
+        manage_key = str(st.get("manage_key") or "__all__")
+        page = int(st.get("page") or 0)
         with DATA_LOCK:
             card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == str(card_id)), None)
         if not card or text == BTN_BACK:
-            show_ttk_manage_page(msg, 0)
+            show_ttk_manage_page(msg, page, manage_key=manage_key)
             return
 
         if text == BTN_TTK_RENAME:
-            USER_STATES[uid] = {"mode": "ttk_wait_rename", "card_id": card_id}
+            USER_STATES[uid] = {
+                "mode": "ttk_wait_rename",
+                "card_id": card_id,
+                "manage_key": manage_key,
+                "page": page,
+            }
             safe_send_text(
                 msg.chat.id,
                 f"Текущее название: <b>{esc(card.get('title') or '')}</b>\nВведи новое название ТТК:",
@@ -1777,7 +2071,12 @@ def handle_text(msg: types.Message):
             return
 
         if text == BTN_TTK_CAT:
-            USER_STATES[uid] = {"mode": "ttk_wait_cat", "card_id": card_id}
+            USER_STATES[uid] = {
+                "mode": "ttk_wait_cat",
+                "card_id": card_id,
+                "manage_key": manage_key,
+                "page": page,
+            }
             safe_send_text(
                 msg.chat.id,
                 f"Выбери категорию для <b>{esc(card.get('title') or '')}</b>:",
@@ -1786,7 +2085,12 @@ def handle_text(msg: types.Message):
             return
 
         if text == BTN_TTK_REPLACE_FILE:
-            USER_STATES[uid] = {"mode": "ttk_wait_replace_file", "card_id": card_id}
+            USER_STATES[uid] = {
+                "mode": "ttk_wait_replace_file",
+                "card_id": card_id,
+                "manage_key": manage_key,
+                "page": page,
+            }
             safe_send_text(
                 msg.chat.id,
                 f"Отправь новый файл (например, .png) или картинку для <b>{esc(card.get('title') or '')}</b>:",
@@ -1798,18 +2102,20 @@ def handle_text(msg: types.Message):
             removed = delete_media_card_by_id(str(card_id), uid, username)
             if removed:
                 safe_send_text(msg.chat.id, f"🗑 Удалено: <b>{esc(removed.get('title') or '')}</b>")
-            show_ttk_manage_page(msg, 0)
+            show_ttk_manage_page(msg, page, manage_key=manage_key)
             return
 
     if st.get("mode") == "ttk_wait_rename":
         card_id = st.get("card_id")
+        manage_key = str(st.get("manage_key") or "__all__")
+        page = int(st.get("page") or 0)
         if text == BTN_BACK:
             with DATA_LOCK:
                 card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == str(card_id)), None)
             if card:
-                open_ttk_card_actions(msg, card)
+                open_ttk_card_actions(msg, card, manage_key=manage_key, page=page)
             else:
-                show_ttk_manage_page(msg, 0)
+                show_ttk_manage_page(msg, page, manage_key=manage_key)
             return
         if not text:
             safe_send_text(msg.chat.id, "Название не может быть пустым. Введи текст:")
@@ -1817,20 +2123,22 @@ def handle_text(msg: types.Message):
         updated = update_media_card_title(str(card_id), text, uid, username)
         if updated:
             safe_send_text(msg.chat.id, f"✅ Новое название: <b>{esc(updated.get('title') or '')}</b>")
-            open_ttk_card_actions(msg, updated)
+            open_ttk_card_actions(msg, updated, manage_key=manage_key, page=page)
         else:
-            show_ttk_manage_page(msg, 0)
+            show_ttk_manage_page(msg, page, manage_key=manage_key)
         return
 
     if st.get("mode") == "ttk_wait_cat":
         card_id = st.get("card_id")
+        manage_key = str(st.get("manage_key") or "__all__")
+        page = int(st.get("page") or 0)
         if text == BTN_BACK:
             with DATA_LOCK:
                 card = next((c for c in DB.get("media_cards", []) if str(c.get("id")) == str(card_id)), None)
             if card:
-                open_ttk_card_actions(msg, card)
+                open_ttk_card_actions(msg, card, manage_key=manage_key, page=page)
             else:
-                show_ttk_manage_page(msg, 0)
+                show_ttk_manage_page(msg, page, manage_key=manage_key)
             return
         chosen_cat = "" if low == "без категории" else low
         if chosen_cat and chosen_cat not in TTK_CATEGORIES:
@@ -1842,9 +2150,10 @@ def handle_text(msg: types.Message):
                 msg.chat.id,
                 f"✅ Категория обновлена: <b>{esc(chosen_cat or 'без категории')}</b>",
             )
-            open_ttk_card_actions(msg, updated)
+            next_key = chosen_cat if manage_key not in ("__all__",) else manage_key
+            open_ttk_card_actions(msg, updated, manage_key=next_key, page=0)
         else:
-            show_ttk_manage_page(msg, 0)
+            show_ttk_manage_page(msg, page, manage_key=manage_key)
         return
 
     if st.get("mode") == "help_wait_text":
@@ -1910,7 +2219,7 @@ def handle_text(msg: types.Message):
         return
 
     if text == BTN_MANAGE_TTK:
-        show_ttk_manage_page(msg, 0)
+        ask_manage_tab(msg)
         return
 
     if text == BTN_CLEAN_TITLES:
@@ -1981,7 +2290,6 @@ def handle_text(msg: types.Message):
         send_support_link(msg)
         return
 
-    # Текстовый поиск по ключевым словам
     print(f"[TEXT_SEARCH] uid={uid} query={text!r}", flush=True)
     log_activity(uid, username, "SEARCH", text[:120])
     matches = find_media_matches(text)
@@ -2018,7 +2326,11 @@ def start_web_server() -> None:
 # ТОЧКА ВХОДА
 # =========================================================
 def main() -> None:
-    print(f"[NEW BUILD v10.21] Запуск бота (supabase: {SUPABASE_ENABLED}, pil: {PIL_AVAILABLE})...", flush=True)
+    print(
+        f"[NEW BUILD v10.24] Запуск бота (supabase: {SUPABASE_ENABLED}, "
+        f"storage: {SUPABASE_STORAGE_ENABLED} [{SUPABASE_STORAGE_BUCKET}], pil: {PIL_AVAILABLE})...",
+        flush=True,
+    )
     load_data()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
